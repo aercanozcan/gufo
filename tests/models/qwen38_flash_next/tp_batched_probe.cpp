@@ -817,11 +817,32 @@ int RunAllReduceBench(
     release();
     return kTransportFailure;
   }
+  // Each rank's partial is a small integer pattern of its rank, the exchange
+  // and the element, exact in float, so every sum is checked exactly. Filling
+  // and checking stay outside the timed interval.
+  const auto pattern = [](std::uint32_t rank, std::uint64_t exchange,
+                          std::size_t i) {
+    return static_cast<float>((i * 7 + exchange * 13 + rank * 1009) % 4096);
+  };
+  const std::uint32_t rank = communicator->rank();
+  std::vector<float> host(max_bytes / sizeof(float));
+  std::uint64_t exchange = 0;
   for (const std::size_t rows : kRows) {
     const std::size_t bytes = rows * kRowBytes;
+    const std::size_t count = bytes / sizeof(float);
     std::vector<double> micros;
     micros.reserve(iterations);
-    for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+    for (std::uint32_t iteration = 0; iteration < iterations;
+         ++iteration, ++exchange) {
+      for (std::size_t i = 0; i < count; ++i) {
+        host[i] = pattern(rank, exchange, i);
+      }
+      if (hipMemcpy(data, host.data(), bytes, hipMemcpyHostToDevice) !=
+          hipSuccess) {
+        Warn(std::string(role) + " allreduce bench could not fill the partial");
+        release();
+        return kTransportFailure;
+      }
       const auto start = std::chrono::steady_clock::now();
       if (!all_reduce(data, bytes, stream, &error)) {
         Warn(std::string(role) + " allreduce bench failed to queue " +
@@ -843,6 +864,25 @@ int RunAllReduceBench(
       micros.push_back(std::chrono::duration<double, std::micro>(
                            std::chrono::steady_clock::now() - start)
                            .count());
+      if (hipMemcpy(host.data(), data, bytes, hipMemcpyDeviceToHost) !=
+          hipSuccess) {
+        Warn(std::string(role) + " allreduce bench could not read the sum");
+        release();
+        return kTransportFailure;
+      }
+      for (std::size_t i = 0; i < count; ++i) {
+        const float expected =
+            pattern(rank, exchange, i) + pattern(1 - rank, exchange, i);
+        if (host[i] != expected) {
+          Warn(std::string(role) +
+               " allreduce bench sum mismatch at exchange " +
+               std::to_string(exchange) + " element " + std::to_string(i) +
+               ": " + std::to_string(host[i]) + " expected " +
+               std::to_string(expected));
+          release();
+          return kTransportFailure;
+        }
+      }
     }
     std::sort(micros.begin(), micros.end());
     double total = 0.0;
@@ -852,7 +892,7 @@ int RunAllReduceBench(
     char line[192];
     std::snprintf(line, sizeof(line),
                   "allreduce rows=%zu bytes=%zu n=%u min_us=%.1f p50_us=%.1f "
-                  "mean_us=%.1f p99_us=%.1f",
+                  "mean_us=%.1f p99_us=%.1f verified=1",
                   rows, bytes, iterations, micros.front(),
                   micros[micros.size() / 2], total / micros.size(),
                   micros[(micros.size() * 99) / 100]);
@@ -1096,6 +1136,7 @@ int main(int argc, char** argv) {
   Say(role.c_str(), "RDMA peer established on bootstrap port " +
                         std::to_string(bootstrap_port));
   if (allreduce_bench != 0) {
+    Say(role.c_str(), "transport " + communicator->Describe());
     return RunAllReduceBench(role.c_str(), communicator, device,
                              allreduce_bench);
   }
