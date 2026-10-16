@@ -1501,8 +1501,7 @@ private:
   [[nodiscard]] bool TakeCompletion(const ibv_wc& completion,
                                     std::uint64_t operation,
                                     const ExpectedReceive& expected,
-                                    bool* written, bool* received,
-                                    std::string* error) {
+                                    bool* received, std::string* error) {
     if (completion.status != IBV_WC_SUCCESS) {
       SetError(error, "verbs all-reduce completion failed with status " +
                           std::to_string(completion.status));
@@ -1510,11 +1509,14 @@ private:
     }
     if (completion.opcode ==
         (expected.window ? IBV_WC_SEND : IBV_WC_RDMA_WRITE)) {
-      if (completion.wr_id != (kWriteTag | operation)) {
-        SetError(error, "verbs write completion is out of order");
+      // Sends complete in order, possibly an exchange late (see
+      // WaitForExchange).
+      if (completion.wr_id != (kWriteTag | sends_done_) ||
+          sends_done_ > operation) {
+        SetError(error, "verbs send completion is out of order");
         return false;
       }
-      *written = true;
+      ++sends_done_;
       return true;
     }
     if (expected.window) {
@@ -1567,14 +1569,16 @@ private:
     return true;
   }
 
-  /// Waits until this rank's write has completed and the peer's write for
-  /// the same exchange has arrived. Spins briefly, then sleeps on the
-  /// completion channel; a closed bootstrap socket reports a dead peer at
-  /// once instead of after the transport's retries.
+  /// Waits until the peer's write or send for this exchange has arrived and
+  /// this rank's earlier ones have completed. This one's completion waits
+  /// for the peer's acknowledgement or placement report, which comes after
+  /// its partial; its window is reused three exchanges later, and a failure
+  /// fails the next exchange. Spins briefly, then sleeps on the completion
+  /// channel; a closed bootstrap socket reports a dead peer at once instead
+  /// of after the transport's retries.
   [[nodiscard]] bool WaitForExchange(std::uint64_t operation,
                                      const ExpectedReceive& expected,
                                      std::string* error) {
-    bool written = false;
     bool received = std::exchange(early_receive_, false);
     if (received && expected.window &&
         (early_immediate_ != expected.immediate ||
@@ -1598,14 +1602,14 @@ private:
         return -1;
       }
       for (int i = 0; i < n; ++i) {
-        if (!TakeCompletion(completions[i], operation, expected, &written,
-                            &received, error)) {
+        if (!TakeCompletion(completions[i], operation, expected, &received,
+                            error)) {
           return -1;
         }
       }
       return n;
     };
-    while (!(written && received)) {
+    while (!(received && sends_done_ >= operation)) {
       const int n = drain();
       if (n < 0) {
         return false;
@@ -1778,6 +1782,8 @@ private:
   // once its exchange is current.
   std::uint32_t early_immediate_{0};
   std::uint32_t early_length_{0};
+  // With device windows: sends whose completion has been seen, in order.
+  std::uint64_t sends_done_{0};
   bool poisoned_{false};
   // The first failure that poisoned the communicator.
   std::string first_error_;
