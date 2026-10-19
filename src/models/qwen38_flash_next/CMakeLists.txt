@@ -3,16 +3,22 @@
 option(GUFO_ENABLE_TP2_RDMA
   "Build the Qwen3.8-Flash-Next TP=2 native RDMA adapter" OFF)
 
+# The verbs adapter and CPU tests share GID selection without a backwards
+# reference from the adapter archive into the model archive (GNU ld is ordered).
+add_library(gufo_qwen38_flash_next_rdma_gid STATIC distributed/rdma_gid.cpp)
+target_compile_features(gufo_qwen38_flash_next_rdma_gid PUBLIC cxx_std_20)
+target_include_directories(gufo_qwen38_flash_next_rdma_gid PUBLIC ${PROJECT_SOURCE_DIR})
+
 add_library(gufo_qwen38_flash_next STATIC
   config.cpp
   continuation_layout.cpp
   ngram.cpp
   weights.cpp
-  distributed/rdma_gid.cpp
   distributed/tp_partition.cpp)
 
 target_include_directories(gufo_qwen38_flash_next PUBLIC ${PROJECT_SOURCE_DIR})
-target_link_libraries(gufo_qwen38_flash_next PUBLIC gufo_core Threads::Threads)
+target_link_libraries(gufo_qwen38_flash_next PUBLIC
+  gufo_core Threads::Threads gufo_qwen38_flash_next_rdma_gid)
 
 if (GUFO_ENABLE_TP2_RDMA)
   if (NOT ENGINE_ENABLE_HIP)
@@ -27,6 +33,7 @@ if (GUFO_ENABLE_TP2_RDMA)
   target_include_directories(gufo_qwen38_flash_next_rdma PRIVATE
     ${PROJECT_SOURCE_DIR})
   target_link_libraries(gufo_qwen38_flash_next_rdma PRIVATE
+    gufo_qwen38_flash_next_rdma_gid
     PkgConfig::IBVERBS Threads::Threads ${CMAKE_DL_LIBS} hip::host)
   target_link_libraries(gufo_qwen38_flash_next PRIVATE
     gufo_qwen38_flash_next_rdma)
