@@ -10,6 +10,7 @@ import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
 import struct
 import sys
@@ -2728,7 +2729,8 @@ def main():
     async def async_local_only(request):
         local_only(request)
 
-    options = dict(api_key="local-test", base_url=args.base_url, max_retries=0,
+    options = dict(api_key=os.environ.get("OPENAI_API_KEY", "local-test"),
+                   base_url=args.base_url, max_retries=0,
                    timeout=120, _strict_response_validation=True)
     report = {"sdk": openai.__version__, "model": args.model, "suite": args.suite,
               "vision": args.vision, "speculative": args.speculative,
