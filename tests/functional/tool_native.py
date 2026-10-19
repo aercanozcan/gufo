@@ -13,6 +13,7 @@ from copy import deepcopy
 import json
 import sys
 
+from tier import rotate
 from tool_reasoning import response_result
 
 SCHEMA = "https://json-schema.org/draft/2020-12/schema"
@@ -178,7 +179,8 @@ def check_native_tool_schemas(client, model, checks, chat_result, sampling_prese
         assert_native(result, label)
 
     for index, name in enumerate(NEIGHBORS):
-        for choice in ("auto", "required"):
+        # The pr tier keeps the choice each neighbor's control runs with.
+        for choice in rotate(("auto", "required"), index):
             label = f"native_{name}_{choice}"
             stream = bool(index % 2)
             request = {**common, "tool_choice": choice,
@@ -207,7 +209,10 @@ def check_native_tool_schemas(client, model, checks, chat_result, sampling_prese
 
             # No instruction is added: the prompt matches the control within
             # the spelling of the renamed keyword. The JSON instruction alone
-            # was about 45 tokens.
+            # was about 45 tokens. Schema rendering does not depend on the
+            # tool choice, so neighbors alternate which choice is controlled.
+            if choice != ("auto", "required")[index % 2]:
+                continue
             control = {**request, "tools": [*opencode_tools(), neighbor(name, True)],
                        "max_completion_tokens": 1}
             baseline = record(label + "_control", chat_result(client, control))
@@ -228,7 +233,7 @@ def check_native_tool_schemas(client, model, checks, chat_result, sampling_prese
          "Call mcp_lookup once with date set to 2026-10-05."),
     )
     for index, (name, expected, instruction) in enumerate(typed):
-        for stream in (False, True):
+        for stream in rotate((False, True), index):
             label = f"native_typed_{name}_{index}_{'stream' if stream else 'buffered'}"
             request = {**common, "tool_choice": "required",
                        "tools": [*opencode_tools(), neighbor(name)],
@@ -299,6 +304,10 @@ def check_native_tool_schemas(client, model, checks, chat_result, sampling_prese
     print(f"CHECK native_schemas_complete deepseek={deepseek}", file=sys.stderr, flush=True)
 
 
+# (responses, stream) pairs; the pr tier rotates one per finite type.
+TRANSPORTS = ((False, False), (False, True), (True, False), (True, True))
+
+
 def check_finite_argument_types(client, model, checks, chat_result, image=None):
     """const/enum without type still have a type, including through unions."""
     check_read_arguments(client, model, checks, chat_result)
@@ -320,27 +329,64 @@ def check_finite_argument_types(client, model, checks, chat_result, image=None):
                     "parameters": {"type": "object", "properties": {"v": schema},
                                    "required": ["v"], "additionalProperties": False}}
         prompt = f"Call record once with v set to {json.dumps(value)}. No other arguments."
-        for responses in (False, True):
-            for stream in (False, True):
-                label = f"finite_type_{index}_{'responses' if responses else 'chat'}_{stream}"
-                if responses:
-                    result = response_result(client, dict(
-                        model=model, input=prompt, tools=[{"type": "function", **function}],
-                        tool_choice="required", temperature=0, reasoning={"effort": "none"},
-                        max_output_tokens=128, store=False), stream)
-                else:
-                    result = chat_result(client, dict(
-                        model=model, messages=[{"role": "user", "content": prompt}],
-                        tools=[{"type": "function", "function": function}],
-                        tool_choice="required", temperature=0, reasoning_effort="none",
-                        max_completion_tokens=128), stream)
-                checks[label] = result
-                assert len(result["tools"]) == 1, (label, result)
-                actual = json.loads(result["tools"][0]["function"]["arguments"])
-                assert actual == {"v": value} and type(actual["v"]) is type(value), (label, actual)
-                assert_native(result, label)
-                print(f"CHECK {label}", file=sys.stderr, flush=True)
+        for responses, stream in rotate(TRANSPORTS, index):
+            label = f"finite_type_{index}_{'responses' if responses else 'chat'}_{stream}"
+            if responses:
+                result = response_result(client, dict(
+                    model=model, input=prompt, tools=[{"type": "function", **function}],
+                    tool_choice="required", temperature=0, reasoning={"effort": "none"},
+                    max_output_tokens=128, store=False), stream)
+            else:
+                result = chat_result(client, dict(
+                    model=model, messages=[{"role": "user", "content": prompt}],
+                    tools=[{"type": "function", "function": function}],
+                    tool_choice="required", temperature=0, reasoning_effort="none",
+                    max_completion_tokens=128), stream)
+            checks[label] = result
+            assert len(result["tools"]) == 1, (label, result)
+            actual = json.loads(result["tools"][0]["function"]["arguments"])
+            assert actual == {"v": value} and type(actual["v"]) is type(value), (label, actual)
+            assert_native(result, label)
+            print(f"CHECK {label}", file=sys.stderr, flush=True)
     check_literal_history(client, model, checks, chat_result, image)
+    check_integer_history(client, model, checks, chat_result)
+
+
+def check_integer_history(client, model, checks, chat_result):
+    """Integers keep their decimal spelling, so replayed calls are reused (#611)."""
+    function = {"name": "read", "description": "Read a local text file.",
+                "parameters": {"type": "object", "properties": {
+                    "path": {"type": "string"}, "limit": {"type": "integer"}},
+                    "required": ["path", "limit"], "additionalProperties": False}}
+    # Both have a shorter exponent spelling (1e+05, 1e+06) than their decimal.
+    for index, limit in enumerate((100000, 1000000)):
+        for stream in rotate((False, True), index):
+            label = f"integer_history_{limit}_{stream}"
+            messages = [{"role": "user", "content":
+                         f"Call read once with path archive-01.txt and limit {limit}."}]
+            request = dict(model=model, messages=messages, temperature=0,
+                           reasoning_effort="none", max_completion_tokens=96,
+                           tools=[{"type": "function", "function": function}],
+                           tool_choice="required", parallel_tool_calls=False)
+            first = chat_result(client, request, stream)
+            checks[label + "_call"] = first
+            assert len(first["tools"]) == 1, (label, first)
+            call = first["tools"][0]
+            arguments = call["function"]["arguments"]
+            assert f'"limit":{limit}' in arguments, (label, arguments)
+            assert type(json.loads(arguments)["limit"]) is int, (label, arguments)
+            # Replay the call exactly as received, as an agent client does.
+            request["messages"] = [*messages, {
+                "role": "assistant", "content": first["text"] or None,
+                "reasoning_content": first["reasoning"], "tool_calls": [call]}, {
+                "role": "tool", "tool_call_id": call["id"], "content": "line 1"}]
+            # Keep tool_choice: changing it alone loses reuse (#619).
+            done = chat_result(client, request, True)
+            checks[label + "_continued"] = done
+            details = done["usage"].get("prompt_tokens_details") or {}
+            assert details.get("cached_tokens", 0) >= first["usage"]["total_tokens"], (
+                label, "replayed integer arguments invalidated the generated call", first, done)
+            print(f"CHECK {label}", file=sys.stderr, flush=True)
 
 
 def check_read_arguments(client, model, checks, chat_result):
@@ -350,8 +396,8 @@ def check_read_arguments(client, model, checks, chat_result):
                     "path": {"type": "string"},
                     "offset": {"type": "number"},
                     "limit": {"type": "number"}}, "required": ["path"]}}
-    # Omitted strict is normalized by Responses. Exercise that real client
-    # contract, not a hand-normalized schema or a one-parameter string tool.
+    # Pi omits strict. All three arguments are requested here, even though
+    # offset and limit remain optional in the supplied schema.
     prompt = "Read archive-00.txt with offset 1 and limit 2000. Use the read tool."
     for responses in (False, True):
         for stream in (False, True):
@@ -534,7 +580,7 @@ def check_llama_cpp_parity(client, model, checks, chat_result, common, deepseek)
     # required tool choice.
     typing = (
         ("str_null", {"type": ["string", "null"]}, "null", None,
-         "Call record with value set to the JSON null."),
+         "Call record with value set to the JSON null literal, not an empty string."),
         ("union_integer", {"anyOf": [{"type": "string"}, {"type": "integer"}]}, "7", 7,
          "Call record with value set to the integer 7."),
         ("all_of_string", {"allOf": [{"type": "string"}, {"minLength": 1}]}, "42", "42",

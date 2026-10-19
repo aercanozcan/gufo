@@ -475,6 +475,8 @@ int main() {
     CheckArgmax(1);
     CheckArgmax(257);
     CheckArgmax(248320);
+    CheckHip(gufo::hip::PrepareBatchedGPUArgmax(), "prepare MTP argmax");
+    CheckArgmax(248320);
     CheckSplitArgmax(2);
     CheckSplitArgmax(256);
     CheckSplitArgmax(248320);
