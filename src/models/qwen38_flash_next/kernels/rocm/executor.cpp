@@ -3281,8 +3281,11 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   // Decode-sized batches replay as graphs; a pooling backlog (the first
   // batch past the budget) needs the wider eager grid.
   const std::uint32_t graph_pool_grid = n / std::max(c.compress_ratio, 1u) + 1;
-  const bool graph = !prefill_phase && n <= kVecBatch &&
-                     pool_grid <= graph_pool_grid &&
+  // TP2 executes eagerly in Run. Make that decision before preparing the
+  // graph prefix too: MixerPart waits for PLE rows itself, so the graph-only
+  // WaitPle below would otherwise consume the gather twice.
+  const bool graph = model_->tp_world_size() == 1 && !prefill_phase &&
+                     n <= kVecBatch && pool_grid <= graph_pool_grid &&
                      session.position_ >= session.VisionLayout().PrefixLength();
   const std::uint64_t key = static_cast<std::uint64_t>(n) |
                             (static_cast<std::uint64_t>(n_logits) << 16) |
