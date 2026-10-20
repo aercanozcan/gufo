@@ -33,8 +33,9 @@ namespace {
 
 constexpr std::uint32_t kMagic = 0x54504331U;  // "TPC1"
 constexpr std::uint16_t kVersion = 21;         // reasoning budgets, prefill
-                                               // lookahead, and the control
-                                               // token proven by HMAC
+                                               // lookahead, the control token
+                                               // proven by HMAC, and mirrored
+                                               // decode draft counts
 constexpr std::uint16_t kHello = 1;
 constexpr std::uint16_t kCommand = 2;
 constexpr std::uint16_t kResponse = 3;
@@ -231,6 +232,11 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
     SetError(error, "TP instruction carries a draw state it does not use");
     return false;
   }
+  // Only a decode carries a draft count.
+  if (instruction.op != TpInstructionOp::kDecode && instruction.drafts != 0) {
+    SetError(error, "TP instruction carries a draft count it does not use");
+    return false;
+  }
   const bool snapshot_op = instruction.op == TpInstructionOp::kSnapshot ||
                            instruction.op == TpInstructionOp::kRestore ||
                            instruction.op == TpInstructionOp::kDrop ||
@@ -253,7 +259,8 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
     SetError(error, "TP instruction batch does not match its operation");
     return false;
   }
-  if (instruction.op != TpInstructionOp::kPrefill && instruction.lookahead != 0) {
+  if (instruction.op != TpInstructionOp::kPrefill &&
+      instruction.lookahead != 0) {
     SetError(error, "TP instruction carries a lookahead it does not use");
     return false;
   }
@@ -269,11 +276,15 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
       for (std::size_t index = 0; valid && index < instruction.batch.size();
            ++index) {
         const auto& member = instruction.batch[index];
-        valid = member.sequence != 0 &&
-                (decode ? member.token == 0 && member.count != 0 &&
-                              member.pending >= -1
-                        : member.token >= 0 && member.count == 0 &&
-                              member.rng == 0 && member.pending == -1);
+        // A member's own draft count is the plan only when the batch, taken
+        // as greedy, has no shared one.
+        valid =
+            member.sequence != 0 &&
+            (member.drafts == 0 || (decode && instruction.batch_drafts == 0)) &&
+            (decode ? member.token == 0 && member.count != 0 &&
+                          member.pending >= -1
+                    : member.token >= 0 && member.count == 0 &&
+                          member.rng == 0 && member.pending == -1);
         // A decode batch draws with each member's own sampler.
         for (std::size_t previous = 0; valid && previous < index; ++previous) {
           valid = instruction.batch[previous].state != member.state &&
@@ -916,6 +927,7 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
     AppendU64(&payload, instruction.file_key);
     AppendU32(&payload, instruction.batch_drafts);
     AppendU32(&payload, instruction.lookahead);
+    AppendU32(&payload, instruction.drafts);
     AppendU32(&payload, static_cast<std::uint32_t>(instruction.batch.size()));
     for (const auto& member : instruction.batch) {
       AppendU64(&payload, member.sequence);
@@ -924,6 +936,7 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
       AppendU32(&payload, member.count);
       AppendU64(&payload, member.rng);
       AppendU32(&payload, static_cast<std::uint32_t>(member.pending));
+      AppendU32(&payload, member.drafts);
     }
   }
   return SendFrame(kCommand, command.sequence, payload, error);
@@ -1094,6 +1107,7 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         !ReadU64(command_prompt_, &offset, &instruction.file_key, error) ||
         !ReadU32(command_prompt_, &offset, &instruction.batch_drafts, error) ||
         !ReadU32(command_prompt_, &offset, &instruction.lookahead, error) ||
+        !ReadU32(command_prompt_, &offset, &instruction.drafts, error) ||
         !ReadU32(command_prompt_, &offset, &batch_size, error) ||
         op > static_cast<std::uint32_t>(TpInstructionOp::kDecodeBatch) ||
         batch_size > kMaxBatchMembers) {
@@ -1111,7 +1125,8 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
           !ReadU32(command_prompt_, &offset, &member_token, error) ||
           !ReadU32(command_prompt_, &offset, &member.count, error) ||
           !ReadU64(command_prompt_, &offset, &member.rng, error) ||
-          !ReadU32(command_prompt_, &offset, &member_pending, error)) {
+          !ReadU32(command_prompt_, &offset, &member_pending, error) ||
+          !ReadU32(command_prompt_, &offset, &member.drafts, error)) {
         return reject("TP control instruction batch is truncated");
       }
       member.token = static_cast<std::int32_t>(member_token);

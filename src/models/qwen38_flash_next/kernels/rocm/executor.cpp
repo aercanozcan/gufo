@@ -1192,10 +1192,11 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     void* control = nullptr;
     void* tokens = nullptr;
     void* logits = nullptr;
-    if (!Check(
-            e->host_allocations_.Allocate(&control, 2 * sizeof(Session::Control)),
-            "pinned control buffer", error_msg) ||
-        !Check(e->host_allocations_.Allocate(&tokens, chunk * sizeof(std::int32_t)),
+    if (!Check(e->host_allocations_.Allocate(&control,
+                                             2 * sizeof(Session::Control)),
+               "pinned control buffer", error_msg) ||
+        !Check(e->host_allocations_.Allocate(&tokens,
+                                             chunk * sizeof(std::int32_t)),
                "pinned token buffer", error_msg) ||
         !Check(
             e->host_allocations_.Allocate(
@@ -1213,8 +1214,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     e->counts_host_ = static_cast<std::uint32_t*>(counts);
     void* tiles = nullptr;
     if (!Check(e->host_allocations_.Allocate(
-                   &tiles,
-                   3 * RoutedTileCapacity(slots, c.num_experts) * sizeof(std::int32_t)),
+                   &tiles, 3 * RoutedTileCapacity(slots, c.num_experts) *
+                               sizeof(std::int32_t)),
                "pinned routed tile map", error_msg)) {
       return nullptr;
     }
