@@ -251,6 +251,23 @@ int main() {
     Require(got_sourced.constrained &&
                 got_sourced.constraint_source == sourced.constraint_source,
             "TP C1 command carries the constraint source exactly");
+    Require(!got_sourced.reasoning_budget && !got.reasoning_budget,
+            "TP C1 command carries no reasoning budget unless given one");
+
+    // Rank 1 rebuilds a reasoning budget from its token count, with or without
+    // a constraint source before it; a zero budget is a budget.
+    for (const bool with_source : {false, true}) {
+      TpControlCommand budgeted = with_source ? sourced : command;
+      budgeted.sequence = with_source ? 13 : 12;
+      budgeted.reasoning_budget = with_source ? 0 : 4096;
+      Require(server->SendCommand(budgeted, &server_error), server_error);
+      TpControlCommand got_budgeted;
+      Require(client->ReceiveCommand(&got_budgeted, &client_error),
+              client_error);
+      Require(got_budgeted.reasoning_budget == budgeted.reasoning_budget &&
+                  got_budgeted.constraint_source == budgeted.constraint_source,
+              "TP C1 command carries the reasoning budget exactly");
+    }
   }
 
   // An instruction is one model call for rank 1 to execute within the request
@@ -276,7 +293,8 @@ int main() {
                       .state = 1,
                       .offset = 512,
                       .count = 512,
-                      .prompt_size = 2054}};
+                      .prompt_size = 2054,
+                      .lookahead = 1024}};
   round_trip(prefill);
   round_trip(
       {.sequence = command.sequence,
@@ -551,6 +569,10 @@ int main() {
     bad.instruction = {.op = TpInstructionOp::kAdvance, .token = 1};
     refuses("an instruction on a request command", bad);
   }
+  refuses("a lookahead on an advance", with([](auto& bad) {
+            bad.instruction = {
+                .op = TpInstructionOp::kAdvance, .token = 1, .lookahead = 1};
+          }));
 
   TpControlResponse response{.sequence = received.sequence,
                              .tokens = {20, 21},

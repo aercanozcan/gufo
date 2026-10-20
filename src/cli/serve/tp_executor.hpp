@@ -172,9 +172,15 @@ public:
   BuildConstraintVocabulary() const override;
   [[nodiscard]] sampling::JsonConstraint::ToolFormat ToolFormat()
       const override;
+  /// Rank 1 builds a request's reasoning budget with its own runner, so rank
+  /// 0 must build it from the same tags, control tokens and vocabulary.
+  [[nodiscard]] ReasoningTags ReasoningBudgetTags() const override;
+  [[nodiscard]] std::uint32_t VocabularySize() const override;
   [[nodiscard]] DeviceProbeStatus PollDevice() const override;
   [[nodiscard]] bool DeviceUsable() const override;
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
+      std::string_view text) const override;
+  [[nodiscard]] std::vector<TextRunnerToken> TokenizeControl(
       std::string_view text) const override;
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override;
@@ -197,6 +203,8 @@ public:
   void PreparePrefixReuse(
       TextRunnerState& state,
       std::span<const TextRunnerToken> prefix) const override;
+  [[nodiscard]] TextRunnerNgramRows NgramRows(
+      const TextRunnerState& state) const override;
   void PrepareBatchExecution(TextRunnerState& state) const override;
   [[nodiscard]] TextPrefillStep Prefill(
       TextRunnerState& state, std::span<const TextRunnerToken> prompt,

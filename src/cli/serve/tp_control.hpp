@@ -130,6 +130,10 @@ struct TpInstruction {
   std::uint64_t file_key{0};
   /// kDecodeBatch only: the batch's draft count plus one, or zero for none.
   std::uint32_t batch_drafts{0};
+  /// kPrefill only: how many request prompt tokens past `prompt_size` the
+  /// runner may read ahead (TextRunnerState::prefill_lookahead). A hint: it
+  /// changes no result, so the execution digest leaves it out.
+  std::uint32_t lookahead{0};
 
   bool operator==(const TpInstruction&) const = default;
 };
@@ -190,6 +194,10 @@ struct TpControlCommand {
   /// from, so it makes the same draft and acceptance decisions in multi-token
   /// cycles. Without it, rank 0 decodes the request one token at a time.
   std::optional<TpConstraintSource> constraint_source;
+  /// kSingle only: the token count of the request's reasoning budget, when
+  /// `sampling` has one. Rank 1 rebuilds the budget from it and the prompt as
+  /// rank 0's runner built it, so both ranks force the same reasoning end.
+  std::optional<std::uint64_t> reasoning_budget;
   /// kSingle only: false when the request decodes past EOS (a raw completion
   /// with `ignore_eos`). Multi-token cycles stop at EOS on both ranks or on
   /// neither.

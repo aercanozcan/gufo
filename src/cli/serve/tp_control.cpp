@@ -27,9 +27,10 @@ namespace gufo::server {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x54504331U;  // "TPC1"
-constexpr std::uint16_t kVersion = 19;         // requests and rank-1 executor
+constexpr std::uint16_t kVersion = 20;         // requests and rank-1 executor
                                                // instructions for concurrent
-                                               // requests
+                                               // requests, reasoning budgets,
+                                               // prefill lookahead
 constexpr std::uint16_t kHello = 1;
 constexpr std::uint16_t kCommand = 2;
 constexpr std::uint16_t kResponse = 3;
@@ -170,7 +171,8 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
          !command.client_id.empty() || !command.prompt_context.empty() ||
          !IsDefaultSampling(command.sampling) || command.constrained ||
          command.sampling.constraint != nullptr || !command.stop_at_eos ||
-         command.constraint_source.has_value();
+         command.constraint_source.has_value() ||
+         command.reasoning_budget.has_value();
 }
 
 [[nodiscard]] std::uint32_t FloatBits(float value) {
@@ -226,6 +228,10 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
     SetError(error, "TP instruction batch does not match its operation");
     return false;
   }
+  if (instruction.op != TpInstructionOp::kPrefill && instruction.lookahead != 0) {
+    SetError(error, "TP instruction carries a lookahead it does not use");
+    return false;
+  }
   bool valid = false;
   switch (instruction.op) {
     case TpInstructionOp::kAdvanceBatch:
@@ -275,7 +281,9 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
     case TpInstructionOp::kPrefill:
       valid = only(false, true, true, true, false) && instruction.count != 0 &&
               instruction.prompt_size > instruction.offset &&
-              instruction.prompt_size <= kMaxPromptTokens;
+              instruction.prompt_size <= kMaxPromptTokens &&
+              instruction.lookahead <=
+                  kMaxPromptTokens - instruction.prompt_size;
       break;
     case TpInstructionOp::kAdvance:
       valid = only(true, false, false, false, false) && instruction.token >= 0;
@@ -800,13 +808,15 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
     AppendU32(&payload, FloatBits(config.frequency_penalty));
     AppendU32(&payload, FloatBits(config.presence_penalty));
     // Request flags: bit 0 constrained decoding, bit 1 decoding past EOS,
-    // bit 2 the constraint's source follows.
+    // bit 2 the constraint's source follows, bit 3 the reasoning budget
+    // follows it.
     const auto& source = command.constraint_source;
     AppendU32(
         &payload,
         (command.constrained || config.constraint != nullptr || source ? 1U
                                                                        : 0U) |
-            (command.stop_at_eos ? 0U : 2U) | (source ? 4U : 0U));
+            (command.stop_at_eos ? 0U : 2U) | (source ? 4U : 0U) |
+            (command.reasoning_budget ? 8U : 0U));
     if (source) {
       AppendString(&payload, source->response_format_json);
       AppendU32(&payload, (source->response_format_responses ? 1U : 0U) |
@@ -820,6 +830,9 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
         AppendString(&payload, tool.parameters_json);
         AppendString(&payload, tool.definition_json);
       }
+    }
+    if (command.reasoning_budget) {
+      AppendU64(&payload, *command.reasoning_budget);
     }
   } else {
     const auto& instruction = command.instruction;
@@ -836,6 +849,7 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
     AppendU32(&payload, static_cast<std::uint32_t>(instruction.pending));
     AppendU64(&payload, instruction.file_key);
     AppendU32(&payload, instruction.batch_drafts);
+    AppendU32(&payload, instruction.lookahead);
     AppendU32(&payload, static_cast<std::uint32_t>(instruction.batch.size()));
     for (const auto& member : instruction.batch) {
       AppendU64(&payload, member.sequence);
@@ -939,7 +953,7 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         !ReadU32(command_prompt_, &offset, &flags, error)) {
       return reject("TP control request sampling is truncated");
     }
-    if (flags > 7 || ((flags & 4U) != 0 && (flags & 1U) == 0)) {
+    if (flags > 15 || ((flags & 4U) != 0 && (flags & 1U) == 0)) {
       return reject("TP control request flags are invalid");
     }
     parsed.constrained = (flags & 1U) != 0;
@@ -977,6 +991,11 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         }
       }
     }
+    if ((flags & 8U) != 0 &&
+        !ReadU64(command_prompt_, &offset,
+                 &parsed.reasoning_budget.emplace(), error)) {
+      return reject("TP control request reasoning budget is truncated");
+    }
     config.temperature = BitsFloat(temperature);
     config.top_k = static_cast<std::int32_t>(top_k);
     config.top_p = BitsFloat(top_p);
@@ -1008,6 +1027,7 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         !ReadU32(command_prompt_, &offset, &pending_bits, error) ||
         !ReadU64(command_prompt_, &offset, &instruction.file_key, error) ||
         !ReadU32(command_prompt_, &offset, &instruction.batch_drafts, error) ||
+        !ReadU32(command_prompt_, &offset, &instruction.lookahead, error) ||
         !ReadU32(command_prompt_, &offset, &batch_size, error) ||
         op > static_cast<std::uint32_t>(TpInstructionOp::kDecodeBatch) ||
         batch_size > kMaxBatchMembers) {

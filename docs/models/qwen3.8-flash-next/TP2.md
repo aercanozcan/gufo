@@ -258,7 +258,11 @@ configuration and prepared images) and closes with `kEnd`. Mirrored calls:
   what its constraint was built from (tools, response format, tool choice),
   and rank 1 builds the same constraint with the same code, so it judges
   drafts as rank 0 does; a constraint without that source decodes one token
-  at a time;
+  at a time. A request with a reasoning budget sends its token count, and rank
+  1 rebuilds the budget from it and the prompt, so both ranks force the same
+  reasoning end. A prefill chunk carries how many prompt tokens past it the
+  runner may read ahead, so both ranks prefetch the next chunk's n-gram rows
+  across cache checkpoints;
 - state resets, and binding a state to its request's prompt context (images
   can reset the state);
 - snapshot, restore, prefix reuse and cancellation preparation, each

@@ -251,7 +251,12 @@ struct TpDiskStore::Impl {
       std::copy(payload.begin(), payload.end(), header.begin() + 64);
       valid = ::pwrite(fd.get(), header.data(), header.size(), 0) ==
                   static_cast<ssize_t>(header.size()) &&
-              ::fsync(fd.get()) == 0 &&
+              ::fsync(fd.get()) == 0;
+      // The image is durable now. Drop its clean pages, as rank 0's disk cache
+      // does, so multi-GB halves don't accumulate in the page cache.
+      if (valid)
+        (void)::posix_fadvise(fd.get(), 0, 0, POSIX_FADV_DONTNEED);
+      valid = valid &&
               ::renameat(directory_fd, temporary.c_str(), directory_fd,
                          Name(job.key, ".snap").c_str()) == 0;
       valid = valid && ::fsync(directory_fd) == 0;
@@ -283,6 +288,8 @@ struct TpDiskStore::Impl {
         Remove(key);
         throw std::runtime_error("TP disk cache entry read failed");
       }
+      // Restore uses the in-memory copy; drop the page-cache one.
+      (void)::posix_fadvise(fd.get(), 0, 0, POSIX_FADV_DONTNEED);
       entries[key].used = ++clock;
     }
     const auto payload =

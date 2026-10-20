@@ -700,6 +700,14 @@ sampling::JsonConstraint::ToolFormat TpMirroredRunner::ToolFormat() const {
   return inner_->ToolFormat();
 }
 
+TextModelRunner::ReasoningTags TpMirroredRunner::ReasoningBudgetTags() const {
+  return inner_->ReasoningBudgetTags();
+}
+
+std::uint32_t TpMirroredRunner::VocabularySize() const {
+  return inner_->VocabularySize();
+}
+
 // Device probes are local to rank 0's GPU and exchange nothing with rank 1.
 TextModelRunner::DeviceProbeStatus TpMirroredRunner::PollDevice() const {
   return inner_->PollDevice();
@@ -712,6 +720,11 @@ bool TpMirroredRunner::DeviceUsable() const {
 std::vector<TextRunnerToken> TpMirroredRunner::Tokenize(
     std::string_view text) const {
   return inner_->Tokenize(text);
+}
+
+std::vector<TextRunnerToken> TpMirroredRunner::TokenizeControl(
+    std::string_view text) const {
+  return inner_->TokenizeControl(text);
 }
 
 std::optional<std::vector<TextRunnerToken>> TpMirroredRunner::RenderAndTokenize(
@@ -824,6 +837,12 @@ void TpMirroredRunner::PreparePrefixReuse(
   });
 }
 
+// Rank 0's own gathers; rank 1 gathers the same rows for its state.
+TextRunnerNgramRows TpMirroredRunner::NgramRows(
+    const TextRunnerState& state) const {
+  return inner_->NgramRows(Mirrored(state).inner());
+}
+
 void TpMirroredRunner::PrepareBatchExecution(TextRunnerState& state) const {
   inner_->PrepareBatchExecution(Mirrored(state).inner());
 }
@@ -841,14 +860,23 @@ TextPrefillStep TpMirroredRunner::Prefill(
   // A budget beyond the remaining prompt means the same as the remaining
   // prompt, and fits the wire; both ranks prefill with the clamped value.
   const std::size_t count = std::min(max_input_tokens, prompt.size() - offset);
+  // The pool's lookahead continues the request prompt past this frontier, as
+  // rank 1's copy of it does, so its length is all rank 1 needs.
+  const auto lookahead = state.prefill_lookahead();
   const TpInstruction instruction{
       .op = TpInstructionOp::kPrefill,
       .state = mirrored.id(),
       .offset = ToWire(offset, "offset"),
       .count = ToWire(count, "budget"),
-      .prompt_size = ToWire(prompt.size(), "prompt")};
+      .prompt_size = ToWire(prompt.size(), "prompt"),
+      .lookahead = ToWire(lookahead.size(), "lookahead")};
   const auto sent = Send(mirrored.id(), instruction, prompt);
   TextPrefillStep step;
+  struct ClearLookahead {
+    TextRunnerState& state;
+    ~ClearLookahead() { state.SetPrefillLookahead({}); }
+  } clear_lookahead{mirrored.inner()};
+  mirrored.inner().SetPrefillLookahead(lookahead);
   try {
     CallScope scope(*this, sent.index);
     step = inner_->Prefill(mirrored.inner(), prompt, offset, count);
@@ -1354,8 +1382,7 @@ struct TpExecutor::Request {
           const sampling::SamplingConfig& sampling,
           std::vector<TextRunnerToken> tokens, std::size_t states)
       : prompt(std::move(tokens)),
-        greedy(begin.sampling.can_use_unmodified_argmax() &&
-               !begin.constrained),
+        greedy(sampling.can_use_unmodified_argmax() && !begin.constrained),
         stop_at_eos(begin.stop_at_eos),
         sampler(sampling, prompt),
         own(states) {}
@@ -1405,6 +1432,10 @@ TpExecutor::TpExecutor(std::shared_ptr<TextModelRunner> runner,
     }
     states_.push_back(std::move(state));
   }
+  // Rank 0's scheduler prepares its vocabulary before serving; rank 1 would
+  // otherwise build its own inside the first constrained request, while rank 0
+  // waits for it in the request's first exchange.
+  (void)runner_->PrepareConstraintVocabulary();
 }
 
 TpExecutor::~TpExecutor() = default;
@@ -1523,7 +1554,8 @@ bool TpExecutor::Open(const TpControlCommand& begin, std::string* error) {
     }
     prompt.push_back(static_cast<TextRunnerToken>(token));
   }
-  // A constraint rank 1 cannot rebuild fails the request, not the pair.
+  // A constraint or reasoning budget rank 1 cannot rebuild fails the request,
+  // not the pair.
   auto sampling = begin.sampling;
   std::string constraint_error;
   if (begin.constraint_source) {
@@ -1534,11 +1566,18 @@ bool TpExecutor::Open(const TpControlCommand& begin, std::string* error) {
       constraint_error = exception.what();
     }
   }
+  if (begin.reasoning_budget) {
+    sampling.reasoning_budget =
+        runner_->BuildReasoningBudget(*begin.reasoning_budget, prompt);
+  }
   auto request = std::make_unique<Request>(begin, sampling, std::move(prompt),
                                            states_.size());
   if (!constraint_error.empty()) {
     request->Note("rank 1 could not rebuild the request's constraint: " +
                   constraint_error);
+  }
+  if (begin.reasoning_budget && sampling.reasoning_budget == nullptr) {
+    request->Note("rank 1 could not rebuild the request's reasoning budget");
   }
   if (!begin.prompt_context.empty()) {
     // A context rank 1 cannot rebuild fails the request, not the pair: its
@@ -1680,6 +1719,16 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
           throw std::invalid_argument("prefill exceeds the request prompt");
         }
         choice.reset();
+        struct ClearLookahead {
+          TextRunnerState& state;
+          ~ClearLookahead() { state.SetPrefillLookahead({}); }
+        } clear_lookahead{state};
+        state.SetPrefillLookahead(
+            std::span<const TextRunnerToken>(request.prompt)
+                .subspan(instruction.prompt_size)
+                .first(std::min<std::size_t>(
+                    instruction.lookahead,
+                    request.prompt.size() - instruction.prompt_size)));
         const auto step = runner_->Prefill(
             state, prefill_prompt, instruction.offset, instruction.count);
         DigestTpPrefill(request.digest, step,
