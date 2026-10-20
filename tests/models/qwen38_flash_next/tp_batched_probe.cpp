@@ -620,9 +620,9 @@ int RunBatched(const char* role, const std::shared_ptr<q::Model>& model,
   std::vector<std::size_t> synced(width, 0);
   const auto step = [&](std::size_t index) {
     const std::size_t size = prompt[index].size();
-    const std::size_t end =
-        prefill_chunk == 0 ? size
-                           : std::min(size, synced[index] + prefill_chunk);
+    const std::size_t end = prefill_chunk == 0
+                                ? size
+                                : std::min(size, synced[index] + prefill_chunk);
     if (!session[index]->Sync(
             std::span<const std::int32_t>(prompt[index]).first(end), error)) {
       return false;
@@ -1218,6 +1218,5 @@ int main(int argc, char** argv) {
   }
   return RunBatched(role.c_str(), model, prompts, budget, context, collectives,
                     serial, moe_input_hashes ? moe_inputs.get() : nullptr,
-                    prefill_chunk, prefill_interleave,
-                    &error);
+                    prefill_chunk, prefill_interleave, &error);
 }
