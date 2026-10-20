@@ -315,11 +315,11 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
       valid = only(false, false, false, false, false);
       break;
     case TpInstructionOp::kPrefill:
-      valid = only(false, true, true, true, false) && instruction.count != 0 &&
-              instruction.prompt_size > instruction.offset &&
-              instruction.prompt_size <= kMaxPromptTokens &&
-              instruction.lookahead <=
-                  kMaxPromptTokens - instruction.prompt_size;
+      valid =
+          only(false, true, true, true, false) && instruction.count != 0 &&
+          instruction.prompt_size > instruction.offset &&
+          instruction.prompt_size <= kMaxPromptTokens &&
+          instruction.lookahead <= kMaxPromptTokens - instruction.prompt_size;
       break;
     case TpInstructionOp::kAdvance:
       valid = only(true, false, false, false, false) && instruction.token >= 0;
@@ -1071,8 +1071,8 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
       }
     }
     if ((flags & 8U) != 0 &&
-        !ReadU64(command_prompt_, &offset,
-                 &parsed.reasoning_budget.emplace(), error)) {
+        !ReadU64(command_prompt_, &offset, &parsed.reasoning_budget.emplace(),
+                 error)) {
       return reject("TP control request reasoning budget is truncated");
     }
     config.temperature = BitsFloat(temperature);

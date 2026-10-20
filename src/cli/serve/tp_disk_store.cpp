@@ -260,9 +260,8 @@ struct TpDiskStore::Impl {
       // does, so multi-GB halves don't accumulate in the page cache.
       if (valid)
         (void)::posix_fadvise(fd.get(), 0, 0, POSIX_FADV_DONTNEED);
-      valid = valid &&
-              ::renameat(directory_fd, temporary.c_str(), directory_fd,
-                         Name(job.key, ".snap").c_str()) == 0;
+      valid = valid && ::renameat(directory_fd, temporary.c_str(), directory_fd,
+                                  Name(job.key, ".snap").c_str()) == 0;
       valid = valid && ::fsync(directory_fd) == 0;
     }
     if (!valid)

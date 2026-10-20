@@ -3254,9 +3254,9 @@ public:
     auto& qfn = RequireQwenFlashNextState(state);
     const auto budget =
         std::min<std::size_t>(max_tokens, std::uint64_t{max_draft_tokens_} + 1);
-    return qfn.session().PlanDecode(
-        budget, sampler.config().uses_random_sampling(),
-        static_cast<std::uint32_t>(occupancy));
+    return qfn.session().PlanDecode(budget,
+                                    sampler.config().uses_random_sampling(),
+                                    static_cast<std::uint32_t>(occupancy));
   }
 
   /// `plan`, when given, fixes the cycle's draft count (a TP2 peer's choice).
@@ -4979,9 +4979,8 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
     }
     return impl_->StartTpRequest(
         state, std::move(prompt->tokens), max_tokens, effective_sampling,
-        is_cancelled, stream_output, client_id, request.stop_sequences,
-        initial, request_start, request.cache_prompt,
-        prompt->cache_prefix_tokens,
+        is_cancelled, stream_output, client_id, request.stop_sequences, initial,
+        request_start, request.cache_prompt, prompt->cache_prefix_tokens,
         std::move(prompt->context), request.return_progress, tool_format, true,
         std::move(constraint_source));
   }
