@@ -245,7 +245,10 @@ before each send.
 **Prefill overlap.** A prefill step of up to 8,448 tokens runs as two trunk
 batches a layer apart (one batch under 384 tokens), so each batch's exchange
 crosses the link while the other computes; the results equal two steps of
-those sizes bit for bit.
+those sizes bit for bit. The batches meet at the 128-token grid point nearest
+the middle: prefill is chunk-invariant only for boundaries on that grid (the
+tiled GEMMs stage 128-token tiles), and a split between grid points made the
+same prompt's logits depend on how the scheduler chunked it.
 
 **Rank 1 as executor.** Rank 0 runs the ordinary scheduler, runner pool and
 continuation cache through `TpMirroredRunner`. Just before each call that
@@ -347,8 +350,9 @@ device windows are ([Design](#design)).
   bit), `--decode-tail K` compares decoding the last K tokens with
   prefilling them.
 - `qwen38_flash_next_tp_batched_probe` (`gpu-tp2`): batched against serial
-  decoding on both ranks without the serving stack; `--allreduce-bench N`
-  times the exchange.
+  decoding on both ranks without the serving stack; `--prefill-chunk N` and
+  `--prefill-interleave` prefill as the serving pool does under concurrency;
+  `--allreduce-bench N` times the exchange.
 - `tools/bench/model-bench.py` launches both ranks through a `gufo.tp2`
   overlay in `bench.json` (`remote_host`, `bootstrap_host`, ports, token,
   container and binary); it runs the single-user and users tables, with the
