@@ -194,6 +194,10 @@ Options (the same on both ranks unless noted):
                           exercised with an exact token count. Refused together
                           with --prompt-0 or --prompt-file-0.
   --prompt-tokens-1 N     The same for member 1.
+  --prefill-chunk N       Prefill each prompt in growing N-token prefixes, as
+                          the serving pool does (default: the whole prompt)
+  --prefill-interleave    Take prefill chunks round-robin across the members,
+                          as concurrent requests do
   --help                  This text
 
 Limits:
@@ -566,7 +570,8 @@ int RunBatched(const char* role, const std::shared_ptr<q::Model>& model,
                std::span<const std::vector<std::int32_t>> prompt,
                std::uint32_t budget, std::uint32_t context,
                const std::shared_ptr<CollectiveTrace>& collectives, bool serial,
-               MoeInputHashes* moe_inputs, std::string* error) {
+               MoeInputHashes* moe_inputs, std::uint32_t prefill_chunk,
+               bool prefill_interleave, std::string* error) {
   // Both ranks bind the same scope id. Nothing on the wire negotiates it, so
   // it is a constant agreed by construction, and the log prints it so a
   // reader can confirm both sides bound the same value.
@@ -609,12 +614,38 @@ int RunBatched(const char* role, const std::shared_ptr<q::Model>& model,
     moe_inputs->armed = true;
   }
   collectives->BeginRecording();
-  for (std::size_t index = 0; index < width; ++index) {
-    if (!session[index]->Sync(prompt[index], error)) {
-      (void)collectives->EndRecording();
-      Warn(std::string(role) + " member " + std::to_string(index) +
-           " batched prefill failed: " + *error);
-      return kTransportFailure;
+  // With --prefill-chunk, each member syncs growing prefixes of its prompt
+  // as the serving pool does; --prefill-interleave takes those chunks
+  // round-robin across the members, as concurrent requests do.
+  std::vector<std::size_t> synced(width, 0);
+  const auto step = [&](std::size_t index) {
+    const std::size_t size = prompt[index].size();
+    const std::size_t end =
+        prefill_chunk == 0 ? size
+                           : std::min(size, synced[index] + prefill_chunk);
+    if (!session[index]->Sync(
+            std::span<const std::int32_t>(prompt[index]).first(end), error)) {
+      return false;
+    }
+    synced[index] = end;
+    return true;
+  };
+  bool prefilled = false;
+  while (!prefilled) {
+    prefilled = true;
+    for (std::size_t index = 0; index < width; ++index) {
+      while (synced[index] < prompt[index].size()) {
+        if (!step(index)) {
+          (void)collectives->EndRecording();
+          Warn(std::string(role) + " member " + std::to_string(index) +
+               " batched prefill failed: " + *error);
+          return kTransportFailure;
+        }
+        if (prefill_interleave) {
+          prefilled = prefilled && synced[index] == prompt[index].size();
+          break;
+        }
+      }
     }
   }
   if (moe_inputs != nullptr) {
@@ -930,6 +961,8 @@ int main(int argc, char** argv) {
   std::optional<std::uint32_t> gid;
   /// `--serial`: the baseline, advancing the members one at a time.
   bool serial = false;
+  std::uint32_t prefill_chunk = 0;
+  bool prefill_interleave = false;
   /// `--allreduce-bench N`: time N exchanges per payload with no model.
   std::uint32_t allreduce_bench = 0;
   /// `--moe-input-hashes`: print a hash of every MoE input during prefill.
@@ -1017,6 +1050,13 @@ int main(int argc, char** argv) {
       gid = parsed;
     } else if (arg == "--serial") {
       serial = true;
+    } else if (arg == "--prefill-chunk") {
+      if (!ParseUint(next(), &prefill_chunk) || prefill_chunk == 0) {
+        Warn("--prefill-chunk requires a positive token count");
+        return kInvalidArguments;
+      }
+    } else if (arg == "--prefill-interleave") {
+      prefill_interleave = true;
     } else if (arg == "--width") {
       if (!ParseUint(next(), &width) || width < kPromptOptions ||
           width > kMaxWidth) {
@@ -1178,5 +1218,6 @@ int main(int argc, char** argv) {
   }
   return RunBatched(role.c_str(), model, prompts, budget, context, collectives,
                     serial, moe_input_hashes ? moe_inputs.get() : nullptr,
+                    prefill_chunk, prefill_interleave,
                     &error);
 }
