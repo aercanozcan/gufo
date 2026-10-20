@@ -3210,7 +3210,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
   const bool prefill = mode == ForwardMode::kPrefill;
-  const std::uint32_t lead = prefill ? PairLead(n) : 0;
+  const std::uint32_t lead = prefill ? PairLead(n, session.position_) : 0;
   const bool pair = lead != 0;
   if (checkpoint && (mode != ForwardMode::kPrefill ||
                      checkpoint->source != &session || checkpoint->tokens > n ||

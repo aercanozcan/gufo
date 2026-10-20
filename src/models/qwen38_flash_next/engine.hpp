@@ -94,10 +94,10 @@ public:
   /// Prompt tokens one prefill step feeds: under TP, up to two trunk
   /// batches run as an overlapped pair.
   [[nodiscard]] std::uint32_t PrefillCapacity() const noexcept;
-  /// The first trunk batch's rows when a prefill step of `tokens` runs as a
-  /// pair, else 0.
+  /// The first trunk batch's rows when a prefill step of `tokens` from
+  /// position `start` runs as a pair, else 0.
   [[nodiscard]] std::uint32_t PrefillPairLead(
-      std::uint32_t tokens) const noexcept;
+      std::uint32_t tokens, std::uint32_t start) const noexcept;
   /// The widest final prefill pass: a chunk plus a short prompt tail, so a
   /// prompt just past a chunk takes no second pass.
   [[nodiscard]] std::uint32_t PrefillThroughCapacity() const noexcept;

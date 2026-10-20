@@ -470,18 +470,28 @@ public:
     return options_.split_reduce.start ? 2 * options_.max_batch
                                        : options_.max_batch;
   }
-  /// With a split reduce, a prefill chunk of `n` tokens runs as two trunk
-  /// batches of about half each, so each batch's sums cross the link while
-  /// the other computes; returns the first batch's rows, or 0 when the chunk
-  /// runs as one batch (without a split reduce, or too short to repay a
-  /// second pass over each layer's weights: measured on Q4 TP2 with MTP, a
-  /// pair lost 6% at 258 tokens and gained 3% at 378 and 12% at 543).
-  [[nodiscard]] std::uint32_t PairLead(std::uint32_t n) const noexcept {
+  /// With a split reduce, a prefill chunk of `n` tokens from position
+  /// `start` runs as two trunk batches of about half each, so each batch's
+  /// sums cross the link while the other computes; returns the first batch's
+  /// rows, or 0 when the chunk runs as one batch (without a split reduce, or
+  /// too short to repay a second pass over each layer's weights: measured on
+  /// Q4 TP2 with MTP, a pair lost 6% at 258 tokens and gained 3% at 378 and
+  /// 12% at 543). The batches meet on the 128-token grid the tiled GEMMs
+  /// stage: prefill arithmetic is independent of chunk boundaries only on
+  /// that grid, so a split between grid points would change the logits of
+  /// the same prompt with the chunking.
+  [[nodiscard]] std::uint32_t PairLead(std::uint32_t n,
+                                       std::uint32_t start) const noexcept {
     constexpr std::uint32_t kPairMinTokens = 384;
-    return options_.split_reduce.start && n >= kPairMinTokens &&
-                   n <= PrefillChunk()
-               ? (n + 1) / 2
-               : 0;
+    constexpr std::uint32_t kPairGrid = 128;
+    if (!options_.split_reduce.start || n < kPairMinTokens ||
+        n > PrefillChunk()) {
+      return 0;
+    }
+    const std::uint32_t middle = start + (n + 1) / 2;
+    const std::uint32_t split =
+        (middle + kPairGrid / 2) / kPairGrid * kPairGrid;
+    return split > start && split < start + n ? split - start : 0;
   }
   [[nodiscard]] std::uint32_t max_speculative() const noexcept {
     return options_.max_speculative;
