@@ -289,8 +289,8 @@ int main(int argc, char** argv) try {
     const double ms = MedianMs(
         [&] {
           if (!q::AttentionF16Gemm(w, x, q_gamma, k_gamma, query, gate, keys,
-                                   values, tokens, position, 1.0e7F, 1.0e-6F,
-                                   nullptr))
+                                   values, tokens, heads, kv_heads, position,
+                                   1.0e7F, 1.0e-6F, nullptr))
             throw std::runtime_error("AttentionF16Gemm");
         },
         reps);
