@@ -174,7 +174,9 @@ class Server:
         self._spawn()
         try:
             return self.wait_ready(timeout)
-        except Exception:
+        except BaseException:
+            # Ctrl-C included: the server runs in its own session, so the
+            # terminal's SIGINT never reaches it.
             self.stop()
             raise
 
@@ -268,7 +270,9 @@ class Tp2Server:
                 extra_processes=[self.remote_process],
                 extra_log_paths=[self.remote_log_path],
             )
-        except Exception:
+        except BaseException:
+            # Ctrl-C included: neither rank receives the terminal's SIGINT, and
+            # __exit__ never runs when __enter__ raises.
             self.failure_exit_code = self._failure_code()
             self.stop()
             raise

@@ -823,6 +823,23 @@ with patch("gufo.model_bench.servers.subprocess.run", side_effect=lambda command
     cleanup_server.stop()
 check(cleanup_events == [("run", "ssh"), ("stop", "remote"), ("run", "podman"), ("stop", "local")],
       "TP2 cleanup removes remote and local containers before reaping clients")
+# Ctrl-C while the ranks load stops both; they run in their own sessions.
+for interrupted in (Server([], "/ready", Path("/unused")),
+                    Tp2Server(Server([], "/ready", Path("/unused")), ["remote"],
+                              remote_host="box2",
+                              remote_log_path=Path("/unused-rank1"))):
+    with patch.object(Server, "_spawn"), \
+         patch.object(Tp2Server, "_spawn_remote"), \
+         patch.object(Server, "wait_ready", side_effect=KeyboardInterrupt), \
+         patch.object(type(interrupted), "stop") as interrupted_stop:
+        try:
+            interrupted.start()
+        except KeyboardInterrupt:
+            pass
+        else:
+            raise AssertionError("the interrupt must propagate")
+    check(interrupted_stop.call_count == 1,
+          f"{type(interrupted).__name__} stops its processes on Ctrl-C")
 
 
 def fake_urlopen_diverging(request, timeout):
