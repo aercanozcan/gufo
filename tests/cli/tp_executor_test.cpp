@@ -896,7 +896,8 @@ std::vector<std::pair<std::string_view, std::size_t>> CapabilityFields(
                final_token_advance_required, incremental_text_is_exact,
                multi_token_decode, batched_multi_token_decode,
                batched_multi_token_decode_max_width, prefix_reuse,
-               in_pass_checkpoint, partial_prefill_retention] = capabilities;
+               in_pass_checkpoint, partial_prefill_retention,
+               prefill_rollback] = capabilities;
   return {{"incremental_prefill", incremental_prefill},
           {"snapshot", snapshot},
           {"fork", fork},
@@ -908,13 +909,15 @@ std::vector<std::pair<std::string_view, std::size_t>> CapabilityFields(
            batched_multi_token_decode_max_width},
           {"prefix_reuse", prefix_reuse},
           {"in_pass_checkpoint", in_pass_checkpoint},
-          {"partial_prefill_retention", partial_prefill_retention}};
+          {"partial_prefill_retention", partial_prefill_retention},
+          {"prefill_rollback", prefill_rollback}};
 }
 
 /// Capabilities TP2 turns off because rank 1 cannot mirror them yet. Each is
 /// a way a TP2 pair falls behind one host; closing one removes it here.
-constexpr std::array<std::string_view, 1> kTp2CapabilityGaps{
+constexpr std::array<std::string_view, 2> kTp2CapabilityGaps{
     "in_pass_checkpoint",  // PrefillThrough: an in-pass prompt checkpoint
+    "prefill_rollback",    // a prefill interrupted mid-pass and rolled back
 };
 
 gufo::sampling::SamplingConfig Sampled() {
@@ -959,6 +962,7 @@ int main() {
         .prefix_reuse = true,
         .in_pass_checkpoint = true,
         .partial_prefill_retention = true,
+        .prefill_rollback = true,
     };
     auto toy = std::make_shared<ToyRunner>(ToyOptions{.capabilities = every});
     const TpMirroredRunner runner(toy, std::make_shared<CaptureSink>());

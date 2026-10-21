@@ -178,6 +178,8 @@ Limits:
     stops at the checkpoint boundary and snapshots there.
     `tp_executor_test` fails when the TP2 wrapper turns off a runner
     capability that is not listed there as such a gap.
+  - No mid-pass prefill rollback (`prefill_rollback`; so far only Qwen 27B's
+    runner offers it): a cancelled prefill finishes its pass on both ranks.
   - A paired prefill chunk computes every row of the final layer, where one
     host skips the rows nothing reads.
 
