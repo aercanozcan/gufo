@@ -284,9 +284,8 @@ std::uint32_t Model::PrefillCapacity() const noexcept {
   return std::min(batches * kPrefillChunkTokens, options_.max_context);
 }
 
-std::uint32_t Model::PrefillPairLead(std::uint32_t tokens,
-                                     std::uint32_t start) const noexcept {
-  return executor_->PairLead(tokens, start);
+std::uint32_t Model::PrefillPairLead(std::uint32_t tokens) const noexcept {
+  return executor_->PairLead(tokens);
 }
 
 std::uint32_t Model::PrefillThroughCapacity() const noexcept {
@@ -760,7 +759,6 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     // The chunk this loop, or the following Sync, takes next.
     const auto rest = off + n < tokens.size() ? tokens.subspan(off + n) : after;
     const auto next = rest.first(chunk_size(rest.size()));
-    const std::uint32_t start = session_->position();
     if (!exec.Forward(*session_, chunk, 1, logits_.data(), mode, error_msg,
                       capture.get(), next)) {
       return false;
@@ -768,7 +766,7 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     // A chunk of two trunk batches keeps the second one's rows; a checkpoint
     // keeps the rows after it (the two never meet: see Executor::Forward).
     const std::uint32_t lead =
-        prefill ? exec.PairLead(static_cast<std::uint32_t>(n), start) : 0;
+        prefill ? exec.PairLead(static_cast<std::uint32_t>(n)) : 0;
     const auto kept =
         capture && capture->tokens < n ? n - capture->tokens : n - lead;
     hidden_base_ = static_cast<std::uint32_t>(

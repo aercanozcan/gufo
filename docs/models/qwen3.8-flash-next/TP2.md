@@ -245,10 +245,10 @@ before each send.
 **Prefill overlap.** A prefill step of up to 8,448 tokens runs as two trunk
 batches a layer apart (one batch under 384 tokens), so each batch's exchange
 crosses the link while the other computes; the results equal two steps of
-those sizes bit for bit. The batches meet at the 128-token grid point nearest
-the middle: prefill is chunk-invariant only for boundaries on that grid (the
-tiled GEMMs stage 128-token tiles), and a split between grid points made the
-same prompt's logits depend on how the scheduler chunked it.
+those sizes bit for bit. The split falls a multiple of 128 rows into the
+step: sparse attention groups four queries from the start of each batch, so
+a split elsewhere regroups them and changes the same prompt's logits with the
+pairing.
 
 **Rank 1 as executor.** Rank 0 runs the ordinary scheduler, runner pool and
 continuation cache through `TpMirroredRunner`. Just before each call that

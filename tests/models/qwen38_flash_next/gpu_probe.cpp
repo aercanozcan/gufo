@@ -680,8 +680,7 @@ int main(int argc, char** argv) {
   for (std::size_t off = 0; off < tokens.size(); off += step) {
     const std::size_t n = std::min<std::size_t>(step, tokens.size() - off);
     const auto rows = static_cast<std::uint32_t>(std::min<std::size_t>(
-        n - executor->PairLead(static_cast<std::uint32_t>(n),
-                               static_cast<std::uint32_t>(off)),
+        n - executor->PairLead(static_cast<std::uint32_t>(n)),
         options.max_logit_rows));
     std::vector<float> out(static_cast<std::size_t>(rows) * c.vocab_size);
     // Name the following chunk as Session::Feed does, so its n-gram read
