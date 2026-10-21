@@ -38,8 +38,8 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/distributed/tp_partition.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/communicator.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/communicator.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #ifdef GUFO_ENABLE_TP2_RDMA

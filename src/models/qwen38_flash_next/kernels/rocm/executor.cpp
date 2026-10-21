@@ -3461,8 +3461,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       // unused F32/Q8 copies when the wide mixer can supply that input
       // directly.
       const bool half_only = WidePrefill(n) && n <= options_.max_batch &&
-                             l.linear &&
-                             DenseF16Route(l.ssm_in, n) &&
+                             l.linear && DenseF16Route(l.ssm_in, n) &&
                              l.ssm_alpha_beta.type == GgmlType::kF16 &&
                              l.ssm_alpha_beta.cols == l.ssm_in.cols;
       if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg,
