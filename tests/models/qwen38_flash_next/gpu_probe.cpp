@@ -39,6 +39,7 @@
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/distributed/tp_partition.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/communicator.hpp"
+#include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #ifdef GUFO_ENABLE_TP2_RDMA
@@ -57,7 +58,8 @@ void AuditMtp(q::rocm::Executor& executor, const q::rocm::DeviceModel& device,
 void AuditMtpCosts(q::rocm::Executor& executor,
                    const gufo::tokenization::QwenTokenizer& tokenizer,
                    std::span<const std::uint32_t> depths,
-                   std::uint32_t concurrency);
+                   std::span<const std::uint32_t> concurrencies,
+                   bool sampled_head);
 
 namespace {
 
@@ -299,7 +301,8 @@ int main(int argc, char** argv) {
   bool mtp_audit = false;
   bool reference = false;
   bool cost_audit = false;
-  std::uint32_t cost_concurrency = 0;
+  bool sampled_head = false;
+  std::vector<std::uint32_t> cost_concurrencies;
   std::optional<std::uint32_t> cost_depth;
   std::uint32_t batch = 512;
   std::uint32_t context = 4096;
@@ -325,17 +328,29 @@ int main(int argc, char** argv) {
       mtp_path = next();
     } else if (arg == "--mtp-audit") {
       mtp_audit = true;
+    } else if (arg == "--sampled-head") {
+      sampled_head = true;
     } else if (arg == "--cost-audit") {
       cost_audit = true;
       const auto value = next();
-      const auto [end, ec] = std::from_chars(
-          value.data(), value.data() + value.size(), cost_concurrency);
-      if (ec != std::errc{} || end != value.data() + value.size() ||
-          (cost_concurrency != 0 && cost_concurrency != 1 &&
-           cost_concurrency != 2 && cost_concurrency != 4 &&
-           cost_concurrency != 6 && cost_concurrency != 8)) {
-        std::fprintf(stderr, "--cost-audit requires C=0/1/2/4/6/8 (0 = all)\n");
-        return 2;
+      if (value != "0") {
+        const char* begin = value.data();
+        const char* finish = begin + value.size();
+        do {
+          std::uint32_t concurrency = 0;
+          const auto [end, ec] = std::from_chars(begin, finish, concurrency);
+          if (ec != std::errc{} || (end != finish && *end != ',') ||
+              (concurrency != 1 && concurrency != 2 && concurrency != 4 &&
+               concurrency != 6 && concurrency != 8) ||
+              (end != finish && end + 1 == finish)) {
+            std::fprintf(stderr,
+                         "--cost-audit requires 0 (all) or a list of "
+                         "1,2,4,6,8\n");
+            return 2;
+          }
+          cost_concurrencies.push_back(concurrency);
+          begin = end == finish ? finish : end + 1;
+        } while (begin != finish);
       }
     } else if (arg == "--depth") {
       const auto value = next();
@@ -453,8 +468,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "--cost-audit cannot be combined with other probes\n");
     return 2;
   }
-  if (cost_depth && !cost_audit) {
-    std::fprintf(stderr, "--depth requires --cost-audit\n");
+  if ((cost_depth || sampled_head) && !cost_audit) {
+    std::fprintf(stderr, "--depth and --sampled-head require --cost-audit\n");
     return 2;
   }
   if (tp_world_size != 1 && tp_world_size != 2) {
@@ -586,6 +601,17 @@ int main(int argc, char** argv) {
                 tp_rank, tp_world_size, partition->ff_count,
                 device->resident_bytes());
   }
+  if (sampled_head) {
+    std::vector<std::int32_t> specials;
+    for (std::uint32_t id = q::kMtpDraftVocab; id < c.vocab_size; ++id)
+      if (tokenizer->IsSpecialToken(id))
+        specials.push_back(id);
+    if (!device->SetDraftVocab(q::kMtpDraftVocab, std::move(specials),
+                               &error)) {
+      std::fprintf(stderr, "draft vocabulary failed: %s\n", error.c_str());
+      return 1;
+    }
+  }
   q::rocm::Executor::Options options;
   options.device_index = static_cast<int>(tp_device);
   options.max_batch = batch;
@@ -617,7 +643,8 @@ int main(int argc, char** argv) {
       std::span<const std::uint32_t> selected_depths = depths;
       if (cost_depth)
         selected_depths = std::span(&*cost_depth, 1);
-      AuditMtpCosts(*executor, *tokenizer, selected_depths, cost_concurrency);
+      AuditMtpCosts(*executor, *tokenizer, selected_depths, cost_concurrencies,
+                    sampled_head);
       return 0;
     } catch (const std::exception& e) {
       std::fprintf(stderr, "cost audit failed: %s\n", e.what());

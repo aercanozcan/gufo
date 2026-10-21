@@ -98,6 +98,12 @@ bool MatrixRows(std::uint32_t rows) {
 bool ExpertMatrixRows(std::uint32_t rows) {
   return prefill_phase || rows > 4 * kVecBatch;
 }
+/// Prefill passes wider than a vector batch take the fused projections and
+/// the paired routed expert tiles: they win from 9 rows up to the full chunk.
+/// Decode and verification batches keep their single-token arithmetic.
+bool WidePrefill(std::uint32_t rows) {
+  return prefill_phase && rows > kVecBatch;
+}
 
 /// Whether mmq's Q8_1 rows of width k carry no padding, so a producer's
 /// contiguous element order is the layout.
@@ -708,6 +714,12 @@ void Session::RestoreVisionLayout(const qwen::vision::RopeLayout& layout,
   }
 }
 
+void Session::PrepareVision(hipStream_t stream) {
+  vision_input_.PrepareRope(stream);
+  for (auto& attention : attention_)
+    attention.rope = vision_input_.rope();
+}
+
 void Session::ConfigureVision(
     std::shared_ptr<const qwen::vision::Prompt> prompt,
     std::shared_ptr<qwen::vision::Encoder> encoder, hipStream_t stream) {
@@ -1260,6 +1272,27 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     std::construct_at(e->mtp_candidates_host_);
     e->mtp_candidates_host_->size =
         std::min<std::size_t>(c.vocab_size, kMtpCandidates);
+    const auto rows = std::min<std::size_t>(7, e->options_.max_speculative - 1);
+    if (rows != 0) {
+      e->verification_ids_ = Alloc<std::uint32_t>(
+          a, rows * MtpCandidateWorkspaceSize(c.vocab_size), error_msg);
+      e->verification_scratch_ids_ = Alloc<std::uint32_t>(
+          a, rows * MtpCandidateWorkspaceSize(c.vocab_size), error_msg);
+      const auto candidates = rows * (kMtpCandidates + kCompactPenaltyLimit);
+      e->verification_candidates_ =
+          Alloc<sampling::LogitCandidate>(a, candidates, error_msg);
+      if (!Check(e->host_allocations_.Allocate(
+                     &e->verification_candidates_host_,
+                     candidates * sizeof(sampling::LogitCandidate)),
+                 "pinned verification candidates", error_msg) ||
+          !Check(hip::AllocateDevice(&e->verification_penalties_,
+                                     rows * kCompactPenaltyLimit *
+                                         sizeof(sampling::TokenPenalty)),
+                 "verification penalties", error_msg))
+        return nullptr;
+      e->verification_penalty_capacity_ = rows * kCompactPenaltyLimit;
+      e->verification_penalty_host_.reserve(e->verification_penalty_capacity_);
+    }
   }
   for (void* p : a) {
     if (p == nullptr) {
@@ -1839,10 +1872,10 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   }
   routed_max_rows_ = std::max<std::uint32_t>(1, max_rows);
   routed_n_tiles_ = n_tiles;
-  // Append the 64-token map for gate/up and eligible down projections.
+  // Prefill appends the 64-token map for gate/up and the down projection.
   // Wide expert buckets also get a 128-token gate/up map: it amortizes
   // weight decoding, while short buckets retain the cheaper 64-token tile.
-  if (n_tokens >= 1024 && routed_tile_rows_ == kRoutedTileRowsWide) {
+  if (WidePrefill(n_tokens)) {
     for (std::uint32_t e = 0; e < c.num_experts; ++e) {
       const std::uint32_t padded = (counts_host_[e] + 15u) / 16u * 16u;
       for (std::uint32_t j = 0; j < (padded + 63u) / 64u; ++j)
@@ -2395,7 +2428,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   if (!l.ssm_in.empty()) {
     // Wide prefill convolves QKV in the projection's LDS tile. The raw
     // boundary rows remain available for the rolling history update.
-    if (!projections_ready && !speculative && n_tokens >= 1024 &&
+    if (!projections_ready && !speculative && WidePrefill(n_tokens) &&
         n_tokens <= options_.max_batch && DenseF16Route(l.ssm_in, n_tokens)) {
       PrepareHalfInput(x, n_tokens, l.ssm_in.cols);
       convolved = DenseF16SsmGemm(
@@ -2499,7 +2532,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   bool prepared = false;
   if (!l.attn_qkv.empty()) {
     const bool fused_projection =
-        !projections_ready && n_tokens >= 1024 &&
+        !projections_ready && WidePrefill(n_tokens) &&
         n_tokens <= options_.max_batch && DenseF16Route(l.attn_qkv, n_tokens) &&
         l.attn_qkv.rows == 2 * (heads.attn + heads.attn_kv) * 256 &&
         l.attn_qkv.cols == 2560 && heads.attn == 12 * heads.attn_kv &&
@@ -2934,15 +2967,15 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
       half_bf16_ = false;
     }
     const auto* x_half = static_cast<const __half*>(s_.x_half);
-    // Large batches pair the gate/up projections and apply SwiGLU without
-    // materializing the gate. Smaller buckets favor separate projections.
+    // Prefill pairs the gate/up projections and applies SwiGLU without
+    // materializing the gate; decode-time batches keep separate projections.
     auto* up_half = reinterpret_cast<__half*>(s_.up_e);
     const WeightType gate_type =
         l.ffn_gate_exps.type == GgmlType::kQ5_K   ? WeightType::kQ5_K
         : l.ffn_gate_exps.type == GgmlType::kQ8_0 ? WeightType::kQ8_0
                                                   : WeightType::kQ4_K;
     const bool gated_ok =
-        n_tokens >= 1024 && routed_tile_rows_ == 48
+        routed_64_tiles_ != 0
             ? RoutedGatedF16Gemm(
                   l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type, x_half,
                   s_.routed_tiles + routed_pair_offset_, routed_pair_tiles_,
@@ -2973,8 +3006,8 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     const WeightType down_type = l.ffn_down_exps.type == GgmlType::kQ8_0
                                      ? WeightType::kQ8_0
                                      : WeightType::kQ5_1;
-    // Wide batches take the 64-token down tiles: they decode each expert's
-    // weights over more rows, also where 48-token tiles would be fewer.
+    // Prefill takes the 64-token down tiles: they decode each expert's
+    // weights over more rows, also where narrower tiles would be fewer.
     const bool wide_down = routed_64_tiles_ != 0;
     // The down projection's rows are F16 too: the epilogue reads half the
     // bytes of the largest routed intermediate.
@@ -3427,8 +3460,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       // Both stacked SSM projections consume the same F16 input. Avoid writing
       // unused F32/Q8 copies when the wide mixer can supply that input
       // directly.
-      const bool half_only = prefill_phase && n >= 1024 &&
-                             n <= options_.max_batch && l.linear &&
+      const bool half_only = WidePrefill(n) && n <= options_.max_batch &&
+                             l.linear &&
                              DenseF16Route(l.ssm_in, n) &&
                              l.ssm_alpha_beta.type == GgmlType::kF16 &&
                              l.ssm_alpha_beta.cols == l.ssm_in.cols;
@@ -3438,9 +3471,9 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       }
       // The last target layer's query outputs have no later cache consumer.
       // Preserve all K/V/indexer rows and the final query's original tile.
-      const bool last_attention = prefill_phase && !session.mtp_enabled_ &&
-                                  il + 1 == c.num_layers && n >= 1024 &&
-                                  n_logits == 1 && checkpoint == nullptr;
+      const bool last_attention = WidePrefill(n) && !session.mtp_enabled_ &&
+                                  il + 1 == c.num_layers && n_logits == 1 &&
+                                  checkpoint == nullptr;
       if (l.linear) {
         const auto capture =
             checkpoint
@@ -3519,9 +3552,9 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     }
     // The last target layer's query outputs have no later cache consumer.
     // Preserve all K/V/indexer rows and the final query's original tile.
-    const bool last_attention = prefill_phase && !session.mtp_enabled_ &&
-                                il + 1 == c.num_layers && n >= 1024 &&
-                                n_logits == 1 && checkpoint == nullptr;
+    const bool last_attention = WidePrefill(n) && !session.mtp_enabled_ &&
+                                il + 1 == c.num_layers && n_logits == 1 &&
+                                checkpoint == nullptr;
     if (!MixerPart(session, il, batch, normed, true, error_msg, checkpoint,
                    last_attention)) {
       return false;
@@ -3920,10 +3953,10 @@ bool Executor::MixerPart(Session& session, std::uint32_t il,
   }
   // The rank's stacked SSM projections share the F16 mix, just as in the
   // single-host path. Neither consumes its F32 or tiled Q8 copies.
-  const bool half_only =
-      prefill_phase && n >= 1024 && n <= options_.max_batch && l.linear &&
-      DenseF16Route(l.ssm_in, n) && l.ssm_alpha_beta.type == GgmlType::kF16 &&
-      l.ssm_alpha_beta.cols == l.ssm_in.cols;
+  const bool half_only = WidePrefill(n) && n <= options_.max_batch &&
+                         l.linear && DenseF16Route(l.ssm_in, n) &&
+                         l.ssm_alpha_beta.type == GgmlType::kF16 &&
+                         l.ssm_alpha_beta.cols == l.ssm_in.cols;
   if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg,
              half_only)) {
     return false;
@@ -4821,6 +4854,66 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
   const bool completed = Check(hipStreamSynchronize(stream_),
                                "greedy MTP verification", error_msg);
   return copied && completed;
+}
+
+bool Executor::CanCompactMtpVerification(
+    const sampling::SamplerState& sampler) {
+  const auto& config = sampler.config();
+  return config.uses_random_sampling() && config.top_k > 0 &&
+         std::size_t(config.top_k) <= kMtpCandidates &&
+         config.min_keep <= kMtpCandidates &&
+         sampler.penalties().size() + 8 <= kCompactPenaltyLimit &&
+         !sampler.NeedsConstraintMask();
+}
+
+bool Executor::SampledMtpCandidates(
+    std::span<std::span<const sampling::LogitCandidate>> output,
+    const sampling::SamplerState& sampler, std::span<const std::int32_t> drafts,
+    std::string* error_msg) const {
+  const auto rows = output.size();
+  if (rows == 0 || rows > 7 || rows >= options_.max_speculative ||
+      rows != drafts.size() || verification_ids_ == nullptr ||
+      !CanCompactMtpVerification(sampler)) {
+    AssignError(error_msg, "invalid compact MTP verification request");
+    return false;
+  }
+  auto& penalties = verification_penalty_host_;
+  penalties.clear();
+  GreedyPenaltyRows batch{};
+  auto tentative = sampler.WithoutConstraint();
+  for (std::size_t row = 0; row < rows; ++row) {
+    const auto counts = tentative.penalties();
+    penalties.insert(penalties.end(), counts.begin(), counts.end());
+    batch.offsets[row + 1] = penalties.size();
+    if (row + 1 < rows)
+      tentative.Accept(static_cast<sampling::TokenId>(drafts[row]));
+  }
+  batch.penalties = verification_penalties_;
+  if (!penalties.empty() &&
+      !Check(hipMemcpyAsync(verification_penalties_, penalties.data(),
+                            penalties.size() * sizeof(penalties[0]),
+                            hipMemcpyHostToDevice, stream_),
+             "compact verification penalties", error_msg))
+    return false;
+  VerificationCandidates(VerificationLogits(), batch, verification_ids_,
+                         verification_scratch_ids_, verification_candidates_,
+                         rows, config().vocab_size, stream_);
+  const auto count = rows * kMtpCandidates + penalties.size();
+  const bool copied = Check(
+      hipMemcpyAsync(verification_candidates_host_, verification_candidates_,
+                     count * sizeof(sampling::LogitCandidate),
+                     hipMemcpyDeviceToHost, stream_),
+      "compact verification candidates", error_msg);
+  const bool completed =
+      Check(hipStreamSynchronize(stream_), "compact verification", error_msg);
+  if (!copied || !completed)
+    return false;
+  for (std::size_t row = 0; row < rows; ++row)
+    output[row] = {
+        verification_candidates_host_ + row * kMtpCandidates +
+            batch.offsets[row],
+        kMtpCandidates + batch.offsets[row + 1] - batch.offsets[row]};
+  return true;
 }
 
 bool Executor::MtpForward(Session& session,
