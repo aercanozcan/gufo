@@ -355,6 +355,14 @@ device windows are ([Design](#design)).
   decoding on both ranks without the serving stack; `--prefill-chunk N` and
   `--prefill-interleave` prefill as the serving pool does under concurrency;
   `--allreduce-bench N` times the exchange.
+  Its `prefill_tokens_per_s` times a cold prefill straight after the model
+  load. The full Q8 checkpoint (176 GB) exceeds a host's 124 GB of RAM, so
+  the load leaves the PLE n-gram rows that prefill reads from the model file
+  out of the page cache. In about one run in four the first one or two 2048-
+  token passes then take twice as long (2.5–2.7 s against 1.38 s) with the
+  same rows read, and the run reports 10–20% less; separate stalls reach 300
+  tok/s. Compare builds by the median of runs alternating between them, not
+  by single runs. `model-bench.py` warms each server before its timed rows.
 - `tools/bench/model-bench.py` launches both ranks through a `gufo.tp2`
   overlay in `bench.json` (`remote_host`, `bootstrap_host`, ports, token,
   container and binary); it runs the single-user and users tables, with the
