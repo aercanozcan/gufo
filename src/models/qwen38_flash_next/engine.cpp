@@ -56,7 +56,7 @@ struct SessionSnapshotHeader {
   std::uint32_t image_identity_bytes;
   std::uint32_t policy_concurrency;
   std::uint32_t reserved{0};
-  PromptLookup::State lookup;
+  speculative::PromptLookup<>::State lookup;
 };
 static_assert(std::is_trivially_copyable_v<SessionSnapshotHeader>);
 
@@ -129,6 +129,13 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     return nullptr;
   }
   m->weights_ = std::make_unique<ModelWeights>(std::move(*weights));
+  if (options.rope_scaling.has_value()) {
+    if (!ValidateRopeScaling(*options.rope_scaling,
+                             m->weights_->config.context_length, error_msg)) {
+      return nullptr;
+    }
+    m->weights_->config.rope_scaling = *options.rope_scaling;
+  }
   const Config& c = m->weights_->config;
   std::optional<distributed::TpPartition> partition;
   const distributed::TpPartition* partition_ptr = nullptr;
@@ -140,9 +147,10 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     }
     partition_ptr = &*partition;
   }
-  if (options.max_context == 0 || options.max_context > c.context_length) {
+  if (options.max_context == 0 || options.max_context > c.MaxContextLength()) {
     AssignError(error_msg, "context exceeds the model's " +
-                               std::to_string(c.context_length) + " tokens");
+                               std::to_string(c.MaxContextLength()) +
+                               " tokens");
     return nullptr;
   }
   // Under TP2 each rank runs the whole (replicated) vision encoder itself.
@@ -225,6 +233,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
         rocm::Executor::TwoRankSplitReduce(options.communicator, c.hidden_size);
   }
   exec.moe_observer = options.moe_observer;
+  exec.max_context = options.max_context;
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {
@@ -586,7 +595,7 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
     AssignError(error_msg, "session snapshot draft policy is invalid");
     return false;
   }
-  if (!PromptLookup::Valid(header.lookup, header.token_count)) {
+  if (!speculative::PromptLookup<>::Valid(header.lookup, header.token_count)) {
     AssignError(error_msg, "session snapshot prompt-lookup state is invalid");
     return false;
   }
@@ -757,7 +766,21 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                : std::min<std::size_t>(model_->PrefillCapacity(), widest);
   };
   for (std::size_t off = 0; off < tokens.size();) {
-    const std::size_t n = chunk_size(tokens.size() - off);
+    const auto remaining = tokens.size() - off;
+    std::size_t n = chunk_size(remaining);
+    // Extended-context attention can fall back from WMMA to the per-token
+    // kernel. Its checkpoint must end a pass: the fused in-pass path requires
+    // WMMA for both query groups. Preserve ordinary split-pass arithmetic on
+    // either side of the boundary. Use the actual launch capability rather
+    // than the model's independently configured native context length.
+    if ((checkpoint || consume) && boundary > tokens_.size() &&
+        boundary < tokens_.size() + n &&
+        tokens_.size() + n >
+            rocm::WmmaCausalAttentionContextLimit(
+                model_->config().num_heads, model_->config().num_kv_heads,
+                model_->config().head_dim, model_->config().compress_ratio)) {
+      n = boundary - tokens_.size();
+    }
     const auto chunk = tokens.subspan(off, n);
     if (MtpEnabled() && !tokens_.empty() &&
         !DraftCatchUp(chunk[0], false, error_msg)) {
@@ -953,11 +976,11 @@ bool Session::AppendLookup(PendingDecode& pending, bool stop_at_eos,
   if (stop_at_eos && model_->IsStopToken(pending.chain.back())) {
     return false;
   }
-  const auto match =
-      lookup_.Find(tokens_, pending.chain,
-                   pending.sampled ? PromptLookup::kSampledMinMatch
-                                   : PromptLookup::kMinMatch,
-                   require_resume);
+  const auto match = lookup_.Find(
+      tokens_, pending.chain,
+      pending.sampled ? speculative::PromptLookup<>::kSampledMinMatch
+                      : speculative::PromptLookup<>::kMinMatch,
+      require_resume);
   if (match.length == 0) {
     return false;
   }
@@ -1014,24 +1037,20 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const std::size_t room = ContextSize() - tokens_.size();
   const std::size_t cap =
       std::min<std::size_t>({max_tokens, room, exec.max_speculative()});
-  const auto concurrency = model_->DecodeConcurrency();
   // Head eligibility is MtpDraftSubsetAllowed. Sampled cohorts are never
   // jointly planned (DecodeBatchImpl), so a sampled request decides the same
-  // way alone and in any batch. Every request keeps the established length
-  // controller and AR backoff.
+  // way alone and in any batch. A plain greedy request decoding alone has no
+  // peers to delay, so it drafts as on one session. Every request keeps the
+  // established length controller and AR backoff.
   const bool unmodified = !sampler.config().uses_random_sampling() &&
                           !sampler.config().penalties_enabled() &&
                           !sampler.config().constraint;
-  const bool allow_subset =
-      MtpDraftSubsetAllowed(sampler.config().uses_random_sampling(), unmodified,
-                            concurrency, batch_drafts.has_value());
-  // Unplanned greedy cycles are priced at the requests decoding now. Sampled
-  // ones keep the configured concurrency so a seeded request replays the same
-  // widths, and a planned batch keeps the row its plan used.
-  pending->policy_concurrency =
-      sampler.config().uses_random_sampling() || batch_drafts.has_value()
-          ? 0
-          : occupancy;
+  const bool allow_subset = MtpDraftSubsetAllowed(
+      sampler.config().uses_random_sampling(), unmodified,
+      model_->DecodeConcurrency(), occupancy, batch_drafts.has_value());
+  pending->policy_concurrency = MtpPolicyConcurrency(
+      sampler.config().uses_random_sampling(), sampler.config().seed >= 0,
+      batch_drafts.has_value(), occupancy);
   // A forced draft count (a TP2 rank 0's mirrored choice, made by PlanDecode
   // at the same price) overrides the session's own acceptance-history policy,
   // so both ranks run cycles of the same width even when their histories
@@ -1089,7 +1108,8 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   }
   // Both execution paths use the same request-local copy rule. Scheduling
   // a peer must not change a sampled request's proposals or RNG sequence.
-  // A request's first speculative step copies nothing (see PromptLookup).
+  // A request's first speculative step copies nothing (see
+  // speculative::PromptLookup<>).
   pending->lookup_cap = lookup_.Step(base) ? cap : 0;
   if (pending->lookup_cap != 0) {
     lookup_.Extend(tokens_, sampled);
@@ -1375,7 +1395,7 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
   std::array<BatchOutcome, 8> outcomes{};
   std::array<std::uint64_t, 8> epochs{};
   std::array<sampling::SamplerState::DrawState, 8> draws{};
-  std::array<PromptLookup::State, 8> lookup_states{};
+  std::array<speculative::PromptLookup<>::State, 8> lookup_states{};
   std::vector<Request> active;
   active.reserve(requests.size());
   Model* model = nullptr;

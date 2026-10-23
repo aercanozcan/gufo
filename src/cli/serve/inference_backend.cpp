@@ -415,7 +415,7 @@ std::vector<std::uint8_t> DeepSeekCompatibilityIdentity(
 std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
     std::string_view artifact_fingerprint, std::string_view mtp_fingerprint,
     bool has_mtp, std::uint32_t max_context, std::uint32_t max_draft_tokens,
-    std::uint32_t decode_concurrency) {
+    std::uint32_t decode_concurrency, std::string_view position_policy) {
   if (!IsSha256Hex(artifact_fingerprint)) {
     throw std::invalid_argument(
         "Qwen3.8-Flash-Next disk cache requires an artifact fingerprint");
@@ -439,7 +439,7 @@ std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
            << models::qwen38_flash_next::Session::kSnapshotPayloadVersion
            << '\n'
            << "context_tokens=" << max_context << '\n'
-           << "position_policy=absolute-v1\n"
+           << "position_policy=" << position_policy << '\n'
            << "adapters=none\n";
   if (has_mtp) {
     identity << "draft_backend=qfn-mtp-v1\n"
@@ -765,6 +765,8 @@ public:
     result.draft_rounds = verification.draft_count > 0 ? 1 : 0;
     result.draft_tokens = verification.draft_count;
     result.draft_accepted_tokens = verification.accepted_count;
+    result.lookup_tokens = verification.lookup_tokens;
+    result.lookup_accepted_tokens = verification.lookup_accepted_tokens;
     result.execution_plan = {
         .kind = verification.physical_width > 1
                     ? TextExecutionPlanKind::kBatched
@@ -1208,11 +1210,17 @@ public:
             hip::QwenDFlashGpuDraftConfig{
                 .max_context = max_context_,
                 .max_draft_tokens = speculative_options_.max_draft_tokens,
-                .policy = speculative_options_.dflash_policy}),
+                .policy = speculative_options_.dflash_policy},
+            &ledger),
         ledger);
     // Qwen's 256-row chunks are small. Preserve a bounded group before
     // waiting, instead of synchronizing every half-MiB range individually.
     resources->reassignment_batch_size = 16;
+    const auto& adapter =
+        static_cast<models::qwen::ContinuationAdapter&>(*resources->adapter);
+    resources->pinned_bytes = [qwen = &adapter] {
+      return qwen->PinnedCaptureBytes();
+    };
     return resources;
   }
   [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
@@ -2570,7 +2578,9 @@ public:
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
               artifact_fingerprint, use_mtp_ ? mtp_fingerprint : std::string{},
               use_mtp_, max_context_, max_draft_tokens_,
-              model_->DecodeConcurrency()),
+              model_->DecodeConcurrency(),
+              models::qwen38_flash_next::RopePositionPolicy(
+                  model_->config().rope_scaling)),
           .payload_version =
               models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
       };
@@ -3656,7 +3666,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             const TextDiskCacheConfig& disk_cache_config,
                             const std::string& vision_model_path,
                             TextRunnerRamCacheOptions ram_cache_config,
-                            const TextTpConfig& tp_config) {
+                            const TextTpConfig& tp_config,
+                            bool enable_yarn) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -3666,22 +3677,44 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return false;
   }
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
-  const std::string architecture =
-      std::string(reader->GetMetadataString("general.architecture")
-                      .value_or(std::string_view{}));
+  const auto architecture =
+      reader->GetMetadataString("general.architecture").value_or("");
+  if (enable_yarn && architecture != "qwen4exp") {
+    SetError(error, "--enable-yarn applies only to Qwen3.8-Flash-Next");
+    return false;
+  }
   if (tp_config.world_size > 1 && architecture != "qwen4exp") {
     SetError(error, "HTTP TP=2 is supported only by Qwen3.8-Flash-Next");
     return false;
   }
+  // Read once, reused below to derive YaRN from --context for qwen4exp.
+  const std::uint32_t qwen4exp_native_context =
+      architecture == "qwen4exp"
+          ? reader->GetMetadataUint32("qwen4exp.context_length").value_or(0)
+          : 0;
   if (max_context == 0) {
-    const auto native =
-        reader->GetMetadataUint64(architecture + ".context_length").value_or(0);
+    const std::uint64_t native =
+        architecture == "qwen4exp"
+            ? qwen4exp_native_context
+            : reader
+                  ->GetMetadataUint64(std::string(architecture) +
+                                      ".context_length")
+                  .value_or(0);
     if (native < 2 || native > std::numeric_limits<std::uint32_t>::max()) {
       SetError(error,
                "GGUF has no valid native context length; specify --context");
       return false;
     }
     max_context = static_cast<std::uint32_t>(native);
+  }
+  // Static YaRN changes every request, so a context above Flash-Next's
+  // native one needs --enable-yarn. Checked before any weights load.
+  std::optional<models::qwen38_flash_next::RopeScaling> rope_scaling;
+  if (architecture == "qwen4exp" &&
+      !models::qwen38_flash_next::ResolveRopeScaling(
+          max_context, qwen4exp_native_context, enable_yarn, &rope_scaling,
+          error)) {
+    return false;
   }
 
   if (architecture == "deepseek4") {
@@ -3786,12 +3819,20 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .tp_world_size = tp_config.world_size,
             .hip_device = tp_config.hip_device,
             .communicator = tp_config.communicator,
+            .rope_scaling = rope_scaling,
         },
         &load_error);
     if (model == nullptr) {
       SetError(error,
                "Failed to create Qwen3.8-Flash-Next model: " + load_error);
       return false;
+    }
+    if (rope_scaling) {
+      Logger::Info(
+          "loader",
+          "event=yarn factor=" + std::to_string(rope_scaling->factor) +
+              " original_context=" + std::to_string(qwen4exp_native_context) +
+              " context=" + std::to_string(max_context));
     }
     // RAM checkpoints cannot outlive this loaded model. Their process-local
     // identity is sufficient; hashing every shard here adds a complete model
@@ -3859,6 +3900,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   (void)vision_model_path;
   (void)ram_cache_config;
   (void)tp_config;
+  (void)enable_yarn;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif
