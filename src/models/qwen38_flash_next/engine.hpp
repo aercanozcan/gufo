@@ -211,9 +211,12 @@ public:
   /// decoding requests: from the session's acceptance history when the step
   /// would speculate at all, else none (the step then uses its ordinary
   /// width). A TP2 pair's rank 0 chooses it and the step runs with it on both
-  /// ranks.
+  /// ranks. A sampled request that may draft through the small head is priced
+  /// on that head's curve, as PrepareDecode prices it, so the forced count
+  /// keeps the single-host width in the common case.
   [[nodiscard]] std::optional<std::uint32_t> PlanDecode(
-      std::size_t max_tokens, bool sampled, std::uint32_t occupancy = 1) const;
+      std::size_t max_tokens, const sampling::SamplerState& sampler,
+      std::uint32_t occupancy = 1) const;
   struct BatchOutcome {
     bool completed{false};
     std::string error{};

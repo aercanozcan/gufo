@@ -1139,9 +1139,11 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   pending->sampled_subset_cost =
       sampled && gpu_verification && pending->draft_subset &&
       std::min(max_tokens, room) > 2 * exec.max_speculative();
-  if (pending->sampled_subset_cost && !batch_drafts) {
+  if (pending->sampled_subset_cost && !forced) {
     // Price the head actually used, after vocabulary fallback and the copy
-    // bypass. The policy depends only on committed history, not timings.
+    // bypass. The policy depends only on committed history, not timings. A
+    // forced count (a batch plan, or a TP2 rank 0's choice) stands: rank 1
+    // must run the width rank 0 chose, not one from its own history.
     pending->width =
         1 + draft_length_.Choose(static_cast<std::uint32_t>(cap - 1), base,
                                  pending->policy_concurrency, true);
@@ -1387,7 +1389,8 @@ bool Session::DecodeStep(std::size_t max_tokens,
 }
 
 std::optional<std::uint32_t> Session::PlanDecode(
-    std::size_t max_tokens, bool sampled, std::uint32_t occupancy) const {
+    std::size_t max_tokens, const sampling::SamplerState& sampler,
+    std::uint32_t occupancy) const {
   if (!valid_ || !MtpEnabled()) {
     return std::nullopt;
   }
@@ -1397,10 +1400,24 @@ std::optional<std::uint32_t> Session::PlanDecode(
   if (cap <= 1) {
     return std::nullopt;
   }
-  // Priced as PrepareDecode prices an unplanned cycle.
-  return draft_length_.Choose(static_cast<std::uint32_t>(cap - 1),
-                              static_cast<std::uint32_t>(tokens_.size()),
-                              sampled ? 0 : occupancy);
+  // Priced as PrepareDecode prices an unplanned cycle. The head is chosen
+  // after the anchor is drawn, which only the cycle itself can do, so a
+  // sampled request that is eligible for the small head is planned on its
+  // curve; rank 1 runs the width chosen here instead of deciding its own.
+  const bool sampled = sampler.config().uses_random_sampling();
+  const bool gpu_verification =
+      sampler.config().temperature == 0.0F ||
+      rocm::Executor::CanCompactMtpVerification(sampler);
+  const bool subset_cost = sampled && gpu_verification &&
+                           model_->draft_subset_ &&
+                           std::min(max_tokens, room) >
+                               2 * model_->executor_->max_speculative();
+  return draft_length_.Choose(
+      static_cast<std::uint32_t>(cap - 1),
+      static_cast<std::uint32_t>(tokens_.size()),
+      MtpPolicyConcurrency(sampled, sampler.config().seed >= 0, false,
+                           occupancy),
+      subset_cost);
 }
 
 template<class Request>

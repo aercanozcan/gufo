@@ -32,6 +32,9 @@ struct TpControlConfig {
   bool vision{false};
   /// Both ranks keep a disk cache (`--cache-disk`), or neither.
   bool disk_cache{false};
+  /// Both ranks apply static YaRN (`--enable-yarn`), or neither: a rank that
+  /// rotates positions differently reads another model's attention.
+  bool yarn{false};
 };
 
 enum class TpControlCommandKind : std::uint8_t {

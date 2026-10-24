@@ -709,6 +709,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   AppendU32(&payload, config.sessions);
   AppendU32(&payload, config.vision ? 1U : 0U);
   AppendU32(&payload, config.disk_cache ? 1U : 0U);
+  AppendU32(&payload, config.yarn ? 1U : 0U);
   AppendU64(&payload, config.snapshot_budget_bytes);
   // The hello is sent before the peer is authenticated, so it carries a nonce
   // and never the token: the listening rank accepts whoever connects first.
@@ -738,6 +739,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   std::uint32_t sessions = 0;
   std::uint32_t vision = 0;
   std::uint32_t disk_cache = 0;
+  std::uint32_t yarn = 0;
   std::uint64_t snapshot_budget = 0;
   if (!ReadU32(peer, &offset, &rank, error) ||
       !ReadU32(peer, &offset, &world, error) ||
@@ -748,6 +750,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
       !ReadU32(peer, &offset, &sessions, error) ||
       !ReadU32(peer, &offset, &vision, error) ||
       !ReadU32(peer, &offset, &disk_cache, error) ||
+      !ReadU32(peer, &offset, &yarn, error) ||
       !ReadU64(peer, &offset, &snapshot_budget, error) ||
       peer.size() - offset != kNonceBytes) {
     SetError(error, "TP control hello payload is invalid");
@@ -781,6 +784,8 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
           config.vision ? 1U : 0U, vision);
   differs(disk_cache != (config.disk_cache ? 1U : 0U),
           "disk cache (--cache-disk)", config.disk_cache ? 1U : 0U, disk_cache);
+  differs(yarn != (config.yarn ? 1U : 0U), "YaRN (--enable-yarn)",
+          config.yarn ? 1U : 0U, yarn);
   // Rank 1 proves the token first; rank 0 answers with its own proof only
   // after checking it, and with an empty refusal otherwise, so a stranger
   // that connects to rank 0 learns nothing about the token.

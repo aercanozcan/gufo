@@ -2971,8 +2971,7 @@ public:
     auto& qfn = RequireQwenFlashNextState(state);
     const auto budget =
         std::min<std::size_t>(max_tokens, std::uint64_t{max_draft_tokens_} + 1);
-    return qfn.session().PlanDecode(budget,
-                                    sampler.config().uses_random_sampling(),
+    return qfn.session().PlanDecode(budget, sampler,
                                     static_cast<std::uint32_t>(occupancy));
   }
 
@@ -4201,6 +4200,9 @@ bool InferenceBackend::load(
   const auto tp_rank = model->TpRank();
   const bool has_mtp = model->HasMtp();
   const bool has_vision = model->VisionEncoder() != nullptr;
+  // The scaling the model applies, not the flag that asked for it: both ranks
+  // must rotate positions the same way.
+  const bool model_yarn = model->config().rope_scaling.Enabled();
   try {
     PrepareVision(model->VisionEncoder());
     auto new_state = std::make_shared<Impl::State>();
@@ -4238,6 +4240,7 @@ bool InferenceBackend::load(
           .sessions = static_cast<std::uint32_t>(session_count),
           .vision = has_vision,
           .disk_cache = DiskCacheEnabled(disk_cache_config),
+          .yarn = model_yarn,
       };
       std::string control_error;
       if (!tp_config.control->Handshake(control_config, &control_error)) {
