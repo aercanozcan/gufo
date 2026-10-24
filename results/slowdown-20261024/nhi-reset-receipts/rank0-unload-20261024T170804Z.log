@@ -1,0 +1,33 @@
+[nhi-reset rank0 unload] boot_id=a71be5d3-cf08-45ba-b3d3-4c63f4be41f2
+[nhi-reset rank0 unload] uname=7.2.5-200.fc44.x86_64
+[nhi-reset rank0 unload] thunderbolt_module=/lib/modules/7.2.5-200.fc44.x86_64/kernel/drivers/thunderbolt/thunderbolt.ko.xz
+[nhi-reset rank0 unload] thunderbolt_sha256=27b7971a688fc8d3ed7e0e1332500d4f06aa10ec0d3ad7a223ae72eb071b9c26
+[nhi-reset rank0 unload] tbparam_asym_threshold=45000
+[nhi-reset rank0 unload] tbparam_bw_alloc_mode=Y
+[nhi-reset rank0 unload] tbparam_clx=Y
+[nhi-reset rank0 unload] tbparam_dma_credits=14
+[nhi-reset rank0 unload] tbparam_dprx_timeout=12000
+[nhi-reset rank0 unload] tbparam_host_reset=Y
+[nhi-reset rank0 unload] tbparam_start_icm=N
+[nhi-reset rank0 unload] tbparam_xdomain=Y
+[nhi-reset rank0 unload] dev[0000:c7:00.5] present vendor=0x1022 device=0x158d class=0x0c0340
+[nhi-reset rank0 unload] reset_method[0000:c7:00.5]=acpi pm
+[nhi-reset rank0 unload] driver[0000:c7:00.5]=thunderbolt
+[nhi-reset rank0 unload] power[0000:c7:00.5]=active
+[nhi-reset rank0 unload] dev[0000:c7:00.6] present vendor=0x1022 device=0x158e class=0x0c0340
+[nhi-reset rank0 unload] reset_method[0000:c7:00.6]=acpi pm
+[nhi-reset rank0 unload] driver[0000:c7:00.6]=thunderbolt
+[nhi-reset rank0 unload] power[0000:c7:00.6]=active
+[nhi-reset rank0 unload] lsmod_thunderbolt:
+thunderbolt_ibverbs   552960  0
+thunderbolt           647168  2 thunderbolt_ibverbs
+[nhi-reset rank0 unload] links:
+[nhi-reset rank0 unload]   0-2 rx=20.0 Gb/s tx=20.0 Gb/s rx_lanes=2 tx_lanes=2
+[nhi-reset rank0 unload]   1-2 rx=20.0 Gb/s tx=20.0 Gb/s rx_lanes=2 tx_lanes=2
+[nhi-reset rank0 unload] stopping service
+[nhi-reset rank0 unload] sanctioned down via /usr/local/lib/evox2-recovery-rank0/scripts/recovery-helper.py
+Sat Oct 24 17:08:04 UTC 2026
+[nhi-reset rank0 unload] rmmod thunderbolt_net
+[nhi-reset rank0 unload] rmmod thunderbolt
+[nhi-reset rank0 unload] unloaded: thunderbolt_ibverbs absent, thunderbolt absent
+[nhi-reset rank0 unload] OK phase=unload rank=0 log=/home/ercanozcan/Desktop/llm/evox2-cluster/results/slowdown-20261024/nhi-reset-receipts/rank0-unload-20261024T170804Z.log

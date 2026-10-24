@@ -1,0 +1,33 @@
+[nhi-reset rank1 unload] boot_id=ea307612-12b6-48f5-9b18-b7952f5a3092
+[nhi-reset rank1 unload] uname=6.19.10-300.fc44.x86_64
+[nhi-reset rank1 unload] thunderbolt_module=/lib/modules/6.19.10-300.fc44.x86_64/kernel/drivers/thunderbolt/thunderbolt.ko.xz
+[nhi-reset rank1 unload] thunderbolt_sha256=0abc7da448e000311bc9157b2acb8a2ec95c52d87524df6af9128b187b84db81
+[nhi-reset rank1 unload] tbparam_asym_threshold=45000
+[nhi-reset rank1 unload] tbparam_bw_alloc_mode=Y
+[nhi-reset rank1 unload] tbparam_clx=Y
+[nhi-reset rank1 unload] tbparam_dma_credits=14
+[nhi-reset rank1 unload] tbparam_dprx_timeout=12000
+[nhi-reset rank1 unload] tbparam_host_reset=Y
+[nhi-reset rank1 unload] tbparam_start_icm=N
+[nhi-reset rank1 unload] tbparam_xdomain=Y
+[nhi-reset rank1 unload] dev[0000:c7:00.5] present vendor=0x1022 device=0x158d class=0x0c0340
+[nhi-reset rank1 unload] reset_method[0000:c7:00.5]=acpi pm
+[nhi-reset rank1 unload] driver[0000:c7:00.5]=thunderbolt
+[nhi-reset rank1 unload] power[0000:c7:00.5]=active
+[nhi-reset rank1 unload] dev[0000:c7:00.6] present vendor=0x1022 device=0x158e class=0x0c0340
+[nhi-reset rank1 unload] reset_method[0000:c7:00.6]=acpi pm
+[nhi-reset rank1 unload] driver[0000:c7:00.6]=thunderbolt
+[nhi-reset rank1 unload] power[0000:c7:00.6]=active
+[nhi-reset rank1 unload] lsmod_thunderbolt:
+thunderbolt_ibverbs   552960  0
+thunderbolt           626688  1 thunderbolt_ibverbs
+[nhi-reset rank1 unload] links:
+[nhi-reset rank1 unload]   0-2 rx=20.0 Gb/s tx=20.0 Gb/s rx_lanes=2 tx_lanes=2
+[nhi-reset rank1 unload]   1-2 rx=20.0 Gb/s tx=20.0 Gb/s rx_lanes=2 tx_lanes=2
+[nhi-reset rank1 unload] stopping service
+[nhi-reset rank1 unload] sanctioned down via /usr/local/lib/evox2-recovery-rank1/scripts/recovery-helper.py
+Sat Oct 24 17:08:09 UTC 2026
+[nhi-reset rank1 unload] rmmod thunderbolt_net
+[nhi-reset rank1 unload] rmmod thunderbolt
+[nhi-reset rank1 unload] unloaded: thunderbolt_ibverbs absent, thunderbolt absent
+[nhi-reset rank1 unload] OK phase=unload rank=1 log=/tmp/nhi-reset.TaIkbG/receipts/rank1-unload-20261024T170809Z.log

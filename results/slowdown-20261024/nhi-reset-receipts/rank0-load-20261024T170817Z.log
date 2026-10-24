@@ -1,0 +1,29 @@
+[nhi-reset rank0 load] modprobe thunderbolt
+[nhi-reset rank0 load] NHI bound to a driver: 2/2
+[nhi-reset rank0 load] links enumerated: 0/2
+[nhi-reset rank0 load] boot_id=a71be5d3-cf08-45ba-b3d3-4c63f4be41f2
+[nhi-reset rank0 load] uname=7.2.5-200.fc44.x86_64
+[nhi-reset rank0 load] thunderbolt_module=/lib/modules/7.2.5-200.fc44.x86_64/kernel/drivers/thunderbolt/thunderbolt.ko.xz
+[nhi-reset rank0 load] thunderbolt_sha256=27b7971a688fc8d3ed7e0e1332500d4f06aa10ec0d3ad7a223ae72eb071b9c26
+[nhi-reset rank0 load] tbparam_asym_threshold=45000
+[nhi-reset rank0 load] tbparam_bw_alloc_mode=Y
+[nhi-reset rank0 load] tbparam_clx=Y
+[nhi-reset rank0 load] tbparam_dma_credits=14
+[nhi-reset rank0 load] tbparam_dprx_timeout=12000
+[nhi-reset rank0 load] tbparam_host_reset=Y
+[nhi-reset rank0 load] tbparam_start_icm=N
+[nhi-reset rank0 load] tbparam_xdomain=Y
+[nhi-reset rank0 load] dev[0000:c7:00.5] present vendor=0x1022 device=0x158d class=0x0c0340
+[nhi-reset rank0 load] reset_method[0000:c7:00.5]=acpi pm
+[nhi-reset rank0 load] driver[0000:c7:00.5]=thunderbolt
+[nhi-reset rank0 load] power[0000:c7:00.5]=active
+[nhi-reset rank0 load] dev[0000:c7:00.6] present vendor=0x1022 device=0x158e class=0x0c0340
+[nhi-reset rank0 load] reset_method[0000:c7:00.6]=acpi pm
+[nhi-reset rank0 load] driver[0000:c7:00.6]=thunderbolt
+[nhi-reset rank0 load] power[0000:c7:00.6]=active
+[nhi-reset rank0 load] lsmod_thunderbolt:
+thunderbolt           647168  0
+[nhi-reset rank0 load] links:
+[nhi-reset rank0 load] WARN: not all links enumerated yet; they train once the peer is loaded too
+[nhi-reset rank0 load] load done
+[nhi-reset rank0 load] OK phase=load rank=0 log=/home/ercanozcan/Desktop/llm/evox2-cluster/results/slowdown-20261024/nhi-reset-receipts/rank0-load-20261024T170817Z.log

@@ -1,0 +1,39 @@
+--- rank1 manifest ---
+{
+    "version": 1,
+    "rank": 1,
+    "user": "ercan",
+    "kernel": "6.19.10-300.fc44.x86_64",
+    "settings": {
+        "transport": "dmabuf",
+        "cables": 2,
+        "rdma_device": "usb4_rdma0",
+        "rank0_lan": "192.168.0.133",
+        "peer_lan": "192.168.0.217"
+    },
+    "policy": "# EVO-X2 recovery: pinned root-owned commands only\nercan ALL=(root) NOPASSWD: NOSETENV: /usr/local/lib/evox2-recovery-rank1/scripts/recovery-helper.py prepare, /usr/local/lib/evox2-recovery-rank1/scripts/recovery-helper.py down, /usr/local/lib/evox2-recovery-rank1/scripts/recovery-helper.py counters, /usr/local/lib/evox2-recovery-rank1/scripts/recovery-helper.py nhi-unload, /usr/local/lib/evox2-recovery-rank1/scripts/recovery-helper.py nhi-reset, /usr/local/lib/evox2-recovery-rank1/scripts/recovery-helper.py nhi-load, /usr/local/lib/evox2-recovery-rank1/scripts/recovery-helper.py revoke, /usr/local/lib/evox2-recovery-rank1/scripts/recovery-helper.py reboot\n",
+    "files": {
+        "scripts/recovery-helper.py": "59e44a775515ee2dece88269471a6745a0e9ed3cb7c17336d656da8aac8f765f",
+        "scripts/driver.sh": "72ca8bf75d97fc866c1d3dee5188215d942e48368b8f3534d6de8d28d44763c6",
+        "scripts/nhi-reset.sh": "46deedbb3111c5cf38f4574d8baf244ba7d981a3ac0e5b68cd9a8ee56a4dfb56",
+        "scripts/cluster.py": "4b2f6893131d954fbd011a3ab0fc95610fc3d99bf641141e1d0a65b1a8d2a115",
+        "scripts/dashboard_probe.py": "1576442312b2452832668ee38c1060194e1cdca9f2ff59d33b23b3356d356592",
+        "config/cluster.json": "2d9913ccfee2ded0bcdd4eac390ee08dc23b31371b5cbecc859691b76a4d0a94",
+        "builds/donnerkeule-6.19.10-300.fc44.x86_64/kernel/thunderbolt_ibverbs.ko": "2ebe0b66dc6d2a70cc4c89a1ec122d8af2da6f1a05e217543c2efd4f6dd6e40d"
+    }
+}
+--- rank1 grants ---
+recovery-helper.py prepare
+recovery-helper.py down
+recovery-helper.py counters
+recovery-helper.py nhi-unload
+recovery-helper.py nhi-reset
+recovery-helper.py nhi-load
+recovery-helper.py revoke
+recovery-helper.py reboot
+--- rank1 helper status ---
+{"installed": true, "rank": 1, "kernel": "6.19.10-300.fc44.x86_64", "state_owned": true, "settings": {"transport": "dmabuf", "cables": 2, "rdma_device": "usb4_rdma0", "rank0_lan": "192.168.0.133", "peer_lan": "192.168.0.217"}}
+--- rank1 shas ---
+59e44a775515ee2dece88269471a6745a0e9ed3cb7c17336d656da8aac8f765f  /usr/local/lib/evox2-recovery-rank1/scripts/recovery-helper.py
+46deedbb3111c5cf38f4574d8baf244ba7d981a3ac0e5b68cd9a8ee56a4dfb56  /usr/local/lib/evox2-recovery-rank1/scripts/nhi-reset.sh
+1576442312b2452832668ee38c1060194e1cdca9f2ff59d33b23b3356d356592  /usr/local/lib/evox2-recovery-rank1/scripts/dashboard_probe.py

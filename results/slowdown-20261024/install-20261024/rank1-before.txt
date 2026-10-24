@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "rank": 1,
+  "user": "ercan",
+  "kernel": "6.19.10-300.fc44.x86_64",
+  "settings": {
+    "transport": "dmabuf",
+    "cables": 2,
+    "rdma_device": "usb4_rdma0",
+    "rank0_lan": "192.168.0.133",
+    "peer_lan": "192.168.0.217"
+  },
+  "policy": "# EVO-X2 recovery: pinned root-owned commands only\nercan ALL=(root) NOPASSWD: NOSETENV: /usr/local/lib/evox2-recovery-rank1/scripts/recovery-helper.py prepare, /usr/local/lib/evox2-recovery-rank1/scripts/recovery-helper.py down, /usr/local/lib/evox2-recovery-rank1/scripts/recovery-helper.py counters, /usr/local/lib/evox2-recovery-rank1/scripts/recovery-helper.py revoke, /usr/local/lib/evox2-recovery-rank1/scripts/recovery-helper.py reboot\n",
+  "files": {
+    "scripts/recovery-helper.py": "3fd7e8fba6663711890a934b286e0e4629d17d84796fe1c60acbb556f8474d5c",
+    "scripts/driver.sh": "72ca8bf75d97fc866c1d3dee5188215d942e48368b8f3534d6de8d28d44763c6",
+    "scripts/cluster.py": "d94604b0f806fdcc33d316346a7fdbc8259eb95b5da5b0ff9b7c5d92fce431ef",
+    "config/cluster.json": "3ad9a8d5b47c84f2ea35f2d2b2e1033905eab4cc700ad868d08e3cfcbd762b29",
+    "builds/donnerkeule-6.19.10-300.fc44.x86_64/kernel/thunderbolt_ibverbs.ko": "2ebe0b66dc6d2a70cc4c89a1ec122d8af2da6f1a05e217543c2efd4f6dd6e40d"
+  }
+}
+
+--- installed helper sha ---
+3fd7e8fba6663711890a934b286e0e4629d17d84796fe1c60acbb556f8474d5c  /usr/local/lib/evox2-recovery-rank1/scripts/recovery-helper.py
+cluster.py
+driver.sh
+__pycache__
+recovery-helper.py

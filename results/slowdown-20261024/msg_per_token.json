@@ -1,0 +1,44 @@
+[
+  {
+    "wall": 3.66,
+    "prompt": 27,
+    "cached": 0,
+    "completion": 1,
+    "decode_ms": 1135.7,
+    "rounds": 0,
+    "plan": "serial-c1",
+    "msg": {
+      "tx_completed": 6887,
+      "tx_posted": 6887,
+      "rx_completed": 6887
+    }
+  },
+  {
+    "wall": 7.63,
+    "prompt": 27,
+    "cached": 27,
+    "completion": 17,
+    "decode_ms": 7483.6,
+    "rounds": 5,
+    "plan": "serial-c1",
+    "msg": {
+      "tx_completed": 5760,
+      "tx_posted": 5760,
+      "rx_completed": 5760
+    }
+  },
+  {
+    "wall": 16.72,
+    "prompt": 27,
+    "cached": 27,
+    "completion": 33,
+    "decode_ms": 16432.7,
+    "rounds": 11,
+    "plan": "serial-c1",
+    "msg": {
+      "tx_completed": 11546,
+      "tx_posted": 11546,
+      "rx_completed": 11546
+    }
+  }
+]

@@ -1,0 +1,20 @@
+{
+  "rank0_lan": "192.168.0.133",
+  "peer_lan": "192.168.0.217",
+  "peer_user": "ercan",
+  "peer_root": "/home/ercan/Desktop/llm/evox2-cluster",
+  "model": "Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf",
+  "mtp": "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+  "vision": "mmproj-BF16.gguf",
+  "context": 262144,
+  "sessions": 1,
+  "port": 8080,
+  "bootstrap_port": 18515,
+  "control_port": 18516,
+  "prefill_chunk": 4224,
+  "speculative": "mtp",
+  "transport": "dmabuf",
+  "cables": 2,
+  "rdma_device": "usb4_rdma0",
+  "cache_namespace": "stock-rdma-resume-B-20261024"
+}

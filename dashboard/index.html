@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EVO-X2 · Cluster</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<header><a class="brand" href="/">EVO<span>×</span>2</a><div id="connection" class="muted">Connecting…</div><button id="logout" class="quiet" hidden>Sign out</button></header>
+<main>
+<section id="login" class="login" hidden><h1>Cluster access</h1><form id="login-form"><label for="token">Dashboard access token</label><input id="token" type="password" required autocomplete="current-password" minlength="32"><button type="submit">Open console</button></form><p id="login-error" role="alert"></p></section>
+<div id="console" hidden>
+<section class="intro"><h1>Cluster overview</h1><div class="status-pill" id="ready">Checking API…</div></section>
+<section class="metrics" aria-label="Inference speed"><article><span>Prefill · reading prompt</span><strong id="prefill">—</strong><small>tok/s · latest server report</small></article><article><span>Decode · writing answer</span><strong id="decode">—</strong><small>tok/s · latest server report</small></article></section>
+<section class="usb4-summary" aria-label="USB4 readiness"><div class="panel-head"><h2>Both hosts</h2><span id="usb4-status" class="status-pill" role="status">Checking cable speeds…</span></div><p id="usb4-detail" class="compact">Waiting for current cable speeds.</p></section>
+<section class="hosts" id="hosts" aria-label="CPU, GPU, memory, temperatures and cable speeds"></section>
+<section class="panel"><h2>Cluster controls</h2><div class="controls"><button data-action="start">Start both</button><button data-action="restart" class="secondary">Restart both</button><button data-action="stop" class="danger">Stop both</button><button data-action="recover" class="secondary">Recover USB4</button><button data-action="nhi-reset" class="secondary">Reset USB4 NHI</button></div><p id="operation" role="status">No control operation requested.</p><p class="muted compact">Start both handles driver preparation, model checks and loading. Recover USB4 stops inference to repair the drivers and leaves it stopped. Reset USB4 NHI is only for a verified interrupt-loss slowdown (fixed ~10 ms per exchange with 40 Gb/s cables); it stops inference, resets the USB4 controllers on both hosts and leaves inference stopped. Cable and rail readiness do not confirm transport or API health.</p></section>
+<footer>Updates every 3 seconds. Cable speeds are per direction; each cable must reach 40 Gb/s.</footer>
+</div>
+</main>
+<dialog id="confirm"><form method="dialog"><h2 id="confirm-title"></h2><p id="confirm-body"></p><div class="controls"><button value="cancel" class="secondary">Cancel</button><button id="confirm-go" value="confirm">Continue</button></div></form></dialog>
+</body></html>

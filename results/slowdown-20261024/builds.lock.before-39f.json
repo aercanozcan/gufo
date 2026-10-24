@@ -1,0 +1,19 @@
+{
+  "time": 1792756526.1895278,
+  "qualified": false,
+  "image_id": "sha256:224bc759a3f74d634e6804dfd909c1694bddcb49c7cb7280887dfb798dc1beac",
+  "gufo_revision": "39f437cc1316c2b24031fef983462feaac88b9d5",
+  "donnerkeule_revision": "d9f7d5a783c87a68f2820c2b6a3ac2d694a9673d",
+  "gufo_sha256": "a2f9fb10ab6250c538943853bff34b968fd47f7976c2d0623b4e898968a16bd0",
+  "provider": "/workspace/builds/rdma-core/lib/libusb4_rdma-rdmav59.so",
+  "provider_sha256": "4da2a90342cef6134b4e6e5ed16688e68ad79e7f5046f4b8ae219f7f04f2d6c4",
+  "modules": {
+    "builds/donnerkeule-7.2.11-200.fc44.x86_64/kernel/thunderbolt_ibverbs.ko": "1bd6c0d6c17ef3f13ee73e012894e029261cb0072d8e5b327f0826e492390c78",
+    "builds/donnerkeule-6.19.10-300.fc44.x86_64/kernel/thunderbolt_ibverbs.ko": "2ebe0b66dc6d2a70cc4c89a1ec122d8af2da6f1a05e217543c2efd4f6dd6e40d",
+    "builds/donnerkeule-7.2.5-200.fc44.x86_64/kernel/thunderbolt_ibverbs.ko": "b562f8769fa592e910d06a499ff7d11c00a0f0ce5053acf246fe7d79b2382815"
+  },
+  "gufo_binary": "builds/gufo-stock-rdma-39f437cc-20261024-bfd-v3/gufo",
+  "diagnostic_only": true,
+  "build_method": "untouched_author_rdma_stock_39f437cc",
+  "source_package_sha256": "e98f5b89a8738e610b0c189c43bdfcf776070cf0b0e65aae4946f64035aa259c"
+}

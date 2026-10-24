@@ -1,0 +1,8 @@
+[nhi-reset rank1 reset] ACPI reset 0000:c7:00.5 (advertised: acpi pm)
+[nhi-reset rank1 reset] reset[0000:c7:00.5] rc=0
+[nhi-reset rank1 reset] post[0000:c7:00.5] vendor=0x1022 reset_method=acpi pm
+[nhi-reset rank1 reset] ACPI reset 0000:c7:00.6 (advertised: acpi pm)
+[nhi-reset rank1 reset] reset[0000:c7:00.6] rc=0
+[nhi-reset rank1 reset] post[0000:c7:00.6] vendor=0x1022 reset_method=acpi pm
+[nhi-reset rank1 reset] both NHI functions ACPI-reset
+[nhi-reset rank1 reset] OK phase=reset rank=1 log=/tmp/nhi-reset.TaIkbG/receipts/rank1-reset-20261024T170817Z.log
