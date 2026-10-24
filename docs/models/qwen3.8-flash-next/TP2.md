@@ -172,7 +172,16 @@ Limits:
   one host writes a native `<tool_call>` (logit 18.83 against 17.19 for the
   client markup `<`) and TP2 the client markup (17.68 against 18.49);
   `qwen38_flash_next_tp_probe --top N --prompt-file FILE` shows such a choice
-  on either.
+  on either. The `tool-parameter-order` suite's `messages_12` and
+  `responses_12_omitted` cases are another: after `<parameter=action>` the
+  model weighs `update`, which the suite expects, against `get` almost evenly.
+  One host scores `update` 25.27 and `get` 24.57, TP2's probe 24.35 and 23.79,
+  both with `list` far behind (21.7). Sampled at temperature 1 (100 requests
+  each) `messages_12` gives `update` with `completed` 54% and `get` 41% on one
+  host, 51% and 45% on TP2; the passing `chat_12` gives 64%/26% and 63%/30%.
+  The distributions agree within sampling error, so TP2 is not skewed; greedy
+  decoding only breaks a near tie, and the TP2 server breaks it toward `get`
+  although the probe's single-step prefill picks `update`.
 - Where TP2 is still behind one host (gaps to close, not design choices):
   - No in-pass prompt checkpoint (`PrefillThrough`): the last prefill pass
     stops at the checkpoint boundary and snapshots there.
