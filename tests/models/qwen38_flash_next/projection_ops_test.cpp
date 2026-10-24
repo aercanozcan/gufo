@@ -259,8 +259,8 @@ void CheckAttentionProjection(
                            static_cast<float*>(expected[1]) + 8,
                            static_cast<__half*>(expected[2]) + 8,
                            static_cast<__half*>(expected[3]) + 8, batch, heads,
-                           kv_heads, 256, 64, position, 1e7F, 1e-6F, nullptr, nullptr,
-                           false, yarn))
+                           kv_heads, 256, 64, position, 1e7F, 1e-6F, nullptr,
+                           nullptr, false, yarn))
     throw std::runtime_error("attention preparation rejected the model shape");
   hipStream_t stream = nullptr;
   hipGraph_t graph = nullptr;
@@ -312,7 +312,8 @@ void CheckAttentionProjection(
                           static_cast<float*>(actual[1]) + 8,
                           static_cast<__half*>(actual[2]) + 8,
                           static_cast<__half*>(actual[3]) + 8, 0, heads,
-                          kv_heads, position, 1e7F, 1e-6F, nullptr, nullptr, yarn))
+                          kv_heads, position, 1e7F, 1e-6F, nullptr, nullptr,
+                          yarn))
     throw std::runtime_error("attention fusion accepted an empty batch");
   CheckHip(hipGraphExecDestroy(replay), "attention graph free");
   CheckHip(hipGraphDestroy(graph), "attention graph definition free");

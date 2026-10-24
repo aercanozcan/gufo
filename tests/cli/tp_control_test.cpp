@@ -718,8 +718,7 @@ int main() {
                    [](TpControlConfig& config) { config.vision = true; });
   refuses_mismatch("disk cache",
                    [](TpControlConfig& config) { config.disk_cache = true; });
-  refuses_mismatch("YaRN",
-                   [](TpControlConfig& config) { config.yarn = true; });
+  refuses_mismatch("YaRN", [](TpControlConfig& config) { config.yarn = true; });
   refuses_mismatch("context",
                    [](TpControlConfig& config) { config.max_context = 8192; });
   refuses_mismatch("control token", [](TpControlConfig& config) {

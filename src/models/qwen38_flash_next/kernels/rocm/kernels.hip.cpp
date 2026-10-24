@@ -7282,9 +7282,9 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
       gate == nullptr || keys == nullptr || values == nullptr ||
       position == nullptr || heads == 0 || kv_heads == 0)
     return false;
-  const AttentionProjectionOutput output{q_gamma, k_gamma, query,    gate,
-                                         keys,    values,  position, theta,
-                                         eps,     rope,    heads,    kv_heads, yarn};
+  const AttentionProjectionOutput output{q_gamma, k_gamma,  query, gate, keys,
+                                         values,  position, theta, eps,  rope,
+                                         heads,   kv_heads, yarn};
   // One 256-row tile per query, gate, key or value head: 52 on one host, 26
   // on each TP2 rank. Row tiles per token tile in launch order share each
   // activation tile's read (four: 8.8 to 7.9 ms at 4,096 tokens), and the

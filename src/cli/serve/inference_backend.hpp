@@ -97,8 +97,7 @@ public:
             const TextDiskCacheConfig& disk_cache_config = {},
             const std::string& vision_model_path = {},
             TextRunnerRamCacheOptions ram_cache_config = {},
-            const TextTpConfig& tp_config = {},
-            bool enable_yarn = false);
+            const TextTpConfig& tp_config = {}, bool enable_yarn = false);
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.

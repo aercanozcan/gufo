@@ -1408,10 +1408,9 @@ std::optional<std::uint32_t> Session::PlanDecode(
   const bool gpu_verification =
       sampler.config().temperature == 0.0F ||
       rocm::Executor::CanCompactMtpVerification(sampler);
-  const bool subset_cost = sampled && gpu_verification &&
-                           model_->draft_subset_ &&
-                           std::min(max_tokens, room) >
-                               2 * model_->executor_->max_speculative();
+  const bool subset_cost =
+      sampled && gpu_verification && model_->draft_subset_ &&
+      std::min(max_tokens, room) > 2 * model_->executor_->max_speculative();
   return draft_length_.Choose(
       static_cast<std::uint32_t>(cap - 1),
       static_cast<std::uint32_t>(tokens_.size()),
