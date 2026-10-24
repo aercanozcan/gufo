@@ -107,6 +107,7 @@ struct TpRequestContext final : TextPromptContext {
       : sequence(sequence), images(std::move(images)) {
     if (this->images != nullptr) {
       cache_identity = this->images->cache_identity;
+      cache_prefixes = this->images->cache_prefixes;
     }
   }
   std::uint64_t sequence;
