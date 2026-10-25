@@ -1,12 +1,143 @@
-# Text API functional tests
+# Model API functional tests
 
 The runner starts an isolated local server and checks real responses with the
 OpenAI SDK. Use production binaries and local weights; no models are downloaded.
 
-Flash-Next prompt lookup has a focused MTP runner. It requires actual accepted
-copies, compares isolated and C2/C4/C6/C8 requests under greedy and the model's
+## Embedding, ASR and TTS service checks
+
+`model_services.py` starts an isolated loopback production server, checks readiness
+and advertised model identity, runs real HTTP inference, and shuts down its owned
+process. These suites are explicit and separate from the text runner's `--suite all`.
+They do not download weights or voice recordings. Missing inputs fail the run.
+Use `nix develop`, or install `tests/functional/requirements.txt` in a virtualenv.
+Build the production binary with `cmake --preset release` and
+`cmake --build --preset release --parallel 4` inside the pinned development shell.
+
+```sh
+nix develop -c python3 tests/functional/model_services.py embedding \
+  --binary build/release/gufo --model models/embeddinggemma-2 \
+  --output artifacts/model-services/embedding-1
+
+nix develop -c python3 tests/functional/model_services.py asr \
+  --binary build/release/gufo --model models/audio/Qwen3-ASR-1.7B \
+  --audio-root models/audio --output artifacts/model-services/asr-1
+
+nix develop -c python3 tests/functional/model_services.py tts \
+  --binary build/release/gufo --model models/audio/Qwen3-TTS-12Hz-1.7B-Base \
+  --audio-root models/audio --variant base \
+  --asr-binary /path/to/pinned/gufo --asr-model models/audio/Qwen3-ASR-1.7B \
+  --output artifacts/model-services/tts-base-1
+```
+
+The audio root must contain `clear-english-voice.wav` and its reviewed sibling
+`.txt` transcript. ASR additionally requires `clear-italian-voice.wav` and `.txt`.
+These recordings remain external; each report retains their hashes and expected
+transcripts. Base TTS registers the English recording as the `narrator` ICL clone.
+For the other checkpoints, select `--variant custom` with the CustomVoice model
+(default speaker `ryan`, override with `--voice`) or `--variant design` with the
+VoiceDesign model (fixed English voice instructions). Neither requires a clone.
+
+| Suite | Required checks |
+| --- | --- |
+| Embedding | Existing text and image HTTP suites: independent reference vectors, dimensions, normalization, encodings, batch ordering, concurrent requests, image formats, invalid inputs and recovery |
+| ASR | English/Italian transcript WER ≤ 0.15, exact greedy replay, JSON/text/verbose formats, complete SSE matching buffered output, different concurrent inputs, silence, rejected options, malformed WAV recovery, stream cancellation and subsequent valid inference |
+| TTS | Voice discovery, valid non-silent 24-kHz mono PCM16 audio, two fixed texts with ASR WER ≤ 0.25, exact same-seed warm replay, WAV/PCM/SSE equality, different concurrent texts/seeds, rejected inputs, stream cancellation and subsequent valid inference |
+
+Audio cancellation must appear against the cancelled request's ID in the server
+log; a client closing a response alone does not satisfy the assertion. SSE must
+include its terminal event and a complete payload. Tests never retry requests.
+The audio checks bound output duration to 0.3–20 seconds and require RMS > 0.001;
+TTS requests use checkpoint sampling, fixed seeds and a 180-codec-step cap.
+
+TTS intelligibility requires an explicitly selected ASR evaluator binary. Pin its
+revision and checkpoint independently when changing ASR or TTS runtime behavior;
+using the same candidate as its own evaluator does not qualify those changes.
+The current ASR malformed-WAV path returns `500 transcription_failed` rather than
+400. The suite records this known limitation and checks its exact error and
+subsequent recovery; it does not claim correct client-error classification.
+
+Every invocation requires a new output directory. `report.json` retains status,
+per-case results, request timings and headers (including available server phase
+measurements), binary/harness hashes, source revision, weight file metadata and
+available download revision metadata. Response bodies, generated WAVs, evaluator
+transcripts and server logs stay beside it. Embedding subreports retain individual
+requests. Exceptions leave a failed report and return a nonzero exit code.
+Timings are observations; this runner does not perform matched baseline timing
+qualification. WebSocket streaming, long recordings, broad language/voice quality
+and speaker-similarity scoring remain separate coverage.
+
+The follow-up Devlab integration must also compare speed against a pinned `main`
+revision, using the same runner, toolchain, weights, settings and request/cache
+histories for both binaries. Follow `phases.py`: pair main/candidate arms, retain
+every repeat and compare each request and phase at the existing 5% and 3-ms
+thresholds. Use server-emitted measurements where available: ASR `Server-Timing`
+phases, TTS synthesis time and codec/audio work counters, and embedding request
+logs and token/input counts. Retain client latency and first-output observations
+separately, verify equivalent work, and keep noisy or missing evidence explicit.
+Include correctness and speed results in the common per-model PR report. The
+current Flash-Next workflow uses the merge base; the follow-up must distinguish
+that revision from the pinned `main` control requested here.
+
+Repeat with fresh output directories to check stability. Preserve failed attempts
+alongside successful runs. CPU checks for metric and incomplete-stream refusal:
+
+```sh
+nix develop -c python3 -m unittest discover -s tests/functional -p test_service_http.py
+```
+
+Qwen 27B deep-history recovery uses separate, explicitly selected workloads:
+
+```sh
+python3 tests/functional/deep_peers_qwen.py \
+  --binary /path/to/production/gufo --model /path/to/qwen27b.gguf \
+  --mode ar --source-revision BUILD_SHA --expect-component --out /tmp/qwen-deep
+python3 tests/functional/over_ram_qwen.py \
+  --binary /path/to/production/gufo --model /path/to/qwen27b.gguf \
+  --mode dflash2 --draft /path/to/dflash2.gguf \
+  --source-revision BUILD_SHA --expect-component --out /tmp/qwen-over-ram
+```
+
+Each starts its own loopback server, retains responses, loaded mode, actual draft
+counts and process/host memory samples, and removes only its owned disk cache
+after retaining an inventory. Use a new output directory for every invocation.
+The deep workload verifies 140K+ tokens, observes a published checkpoint before
+SIGKILL, checks newest compatible checkpoint selection after restarts and peers,
+and compares recovery with `cache_prompt: false` at temperature zero. The over-RAM
+workload verifies a completed cancellation frontier survives short peers and
+requires a rewritten final message to wait for successful deeper publication.
+That edited fork must select the observed published frontier; it cannot require
+a previous live boundary that has no restorable checkpoint.
+It fails if that publication race was not exercised. These are correctness
+workloads outside hosted model CI; retained phase times do not qualify speed.
+CPU evidence-refusal checks run with
+`python3 -m unittest discover -s tests/functional -p test_qwen_recovery.py`;
+they do not establish model correctness.
+
+Qwen 27B cancellation inside a prefill pass has a focused latency regression
+check. It disconnects both a cold prompt and a partially completed prompt,
+serves a short cached peer, then verifies retained work and resumed output:
+
+```sh
+nix develop -c python3 tests/functional/qwen_prefill_cancel.py \
+  --output /tmp/qwen-prefill-cancel -- \
+  /path/to/production/gufo serve llm --model /path/to/qwen27b.gguf \
+  --speculative dflash2 --dflash-model /path/to/draft.gguf
+```
+
+Use `--speculative off` for AR. The test owns its loopback server, records each
+request's phase timings and rejects a multi-second prefill blocking the short
+peer. Apply the usual matched 5% and 3 ms timing gates to its retained results.
+Add `--deep-peers` before `--` and serve with `--sessions 4` to fill the other
+slots with duplicate deep conversations. This checks that a short request
+after cancellation can reuse a redundant slot while another live copy retains
+the generated frontier. It also rejects the roughly 280 ms restore stall.
+
+Flash-Next MTP and Qwen27B DFlash2 prompt lookup have a focused runner. It
+requires actual accepted copies, compares isolated and C2/C4/C6/C8 requests under greedy and the model's
 default sampling, mixes greedy copies with new text at C8, and checks stops
-followed by full replay:
+followed by full replay. It also checks top-k 64/65, disabled top-k and a
+65-token minimum support across warm replay and stops, covering compact
+sampled verification and its complete-vocabulary fallbacks:
 
 ```sh
 nix develop -c python3 tests/functional/prompt_lookup.py \
@@ -15,7 +146,11 @@ nix develop -c python3 tests/functional/prompt_lookup.py \
   --speculative mtp --mtp-model /path/to/mtp.gguf
 ```
 
-The runner owns eight sessions and the loopback listener. It retains individual
+For Qwen27B, substitute `--speculative dflash2 --dflash-model /path/to/draft.gguf`.
+Use `--max-concurrency 4` before `--` for a focused C2/C4 check; the default
+covers C2/C4/C6/C8.
+
+The runner owns its sessions and the loopback listener. It retains individual
 request timings and server logs, and stays outside hosted CI and `--suite all`.
 The native Flash-Next session test additionally checks full logits, RNG and
 snapshot restoration into previously used sessions.
@@ -23,6 +158,22 @@ Pass `--mmproj /path/to/mmproj.gguf` with the server command to add image-backed
 greedy and sampled copies. These cases require accepted lookup tokens before
 client cancellation, confirm the server observed cancellation, and replay the
 same output from the cached image prompt without prefill.
+
+`generation_quality.py` validates reviewed coding responses from the sampled
+Qwen27B generation controls. It checks generated interval tests plus independent
+coverage/input-preservation cases, and retry call counts, delay caps and error behavior.
+It requires completed output, so a truncated thinking response cannot pass:
+
+```sh
+nix develop -c python3 tests/functional/generation_quality.py \
+  /tmp/generation/results.json \
+  --thinking-results /tmp/completed-thinking/results.json
+```
+
+The reports contain `code` and `code-think` entries from `chat_result`, including
+text and finish reason. This executes the reviewed generated Python on the
+development host. The requests and measurement scope are recorded in the
+[Qwen27B quality notes](../../docs/models/qwen3.8-27b/QUALITY.md#october-21-coding-and-prose-follow-up).
 
 `prompt_lookup_workflows.py` checks extraction, generated URI tests and edits
 after a long source archive against an already running Flash-Next MTP server:
@@ -44,6 +195,13 @@ the same source input when comparing revisions. These are public substitutes
 for PR #613's private cases; they do not reproduce the author's exact prompts.
 Run the existing Pi `edit` and `creation` cases for real tool execution, too.
 
+`embeddings.py` checks EmbeddingGemma 2 through the OpenAI SDK against a running `gufo serve embedding`.  It covers the fixture probes against sentence-transformers float32 vectors, input order, base64 and float encodings, Matryoshka `dimensions`, concurrent identical requests, and the error shapes.  It is standalone and outside `--suite all`:
+
+```sh
+nix develop -c python3 tests/functional/embeddings.py \
+  --base-url http://127.0.0.1:8080/v1 --model embeddinggemma-2
+```
+
 Flash-Next startup identity checks use a separate runner with an initially empty
 artifact-hash cache, as on a fresh container. RAM-only serving must skip full-file
 fingerprints and still reuse its prompt. Disk serving must fingerprint the model
@@ -57,7 +215,10 @@ nix develop -c python3 tests/functional/cache_startup.py \
 ```
 
 Run again with `--speculative off` for AR. `--case ram` or `--case disk` selects
-only that lifecycle. Commands, startup times, request timings, responses and logs
+only that lifecycle. For Qwen 27B, add `--model-kind qwen27b` before `--`,
+use its target weights, and select `--speculative off` or
+`--speculative dflash2 --dflash-model /path/to/draft.gguf` in the server command.
+Commands, startup times, request timings, responses and logs
 remain in the output directory. This check stays outside hosted model CI.
 
 The cluster workflow uses [impact.json](impact.json) to select suites from changed
@@ -212,6 +373,12 @@ Each invocation tests **one model and one mode**. Model-specific changes need
 only the affected target/modes. For shared text changes, run the affected suites
 once per row/mode below; no full benchmark sweep is needed.
 
+For correctness capture of slow cold prompts, `--request-timeout SECONDS` sets
+the SDK deadline (default 120); `--suite-timeout SECONDS` separately bounds the
+whole suite (default 900). The request deadline is retained in both reports and
+must match for baseline comparison. Longer deadlines do not change assertions
+or timing margins; retain the original timeout failure when investigating it.
+
 | Target | `--speculative` modes | Sidecar option |
 | --- | --- | --- |
 | Qwen27B Q4_K_XL | `off`, `dflash2` | `--dflash-model` |
@@ -268,7 +435,7 @@ RAM, disk and restart settings once their contracts pass.
 | `state-edges` | Actual AR/draft execution, tiny thinking budgets, zero-argument tools, schema changes, stops (including inside quoted calls), image retry and failed-request recovery |
 | `structured`, `structured-limits` | Request JSON schemas, SDK parsing, limits and stops |
 | `sampling-defaults`, `sampling-ranges` | CLI/request overrides, partial/null settings and range validation |
-| `batch` | Independent requests across Chat, Responses and Completions; sessions 1–8 |
+| `batch` | Independent requests across Chat, Responses and Completions; batched short greedy replies match serial ones; sessions 1–8 |
 | `progress` | Opt-in progress on all text endpoints; output/sampling equality, limits, stops, images, batching and cancel/resume |
 | `stream-start` | Plain streams on all text endpoints send headers before a cold prefill completes; a stream queued behind every session sends them after the five-second bound |
 | `prefill-scheduling` | Short arrival during a cold prefill: work-aligned arrival, independent per-request timings, unchanged output and no repeated prefill. Requires sessions ≥2 and context ≥16384; not in `all` |
@@ -573,10 +740,30 @@ HTTP requests/responses and timings. It removes its own cache after each case.
 Use `--case bound --expect cap` only for a matched pre-fix main timing control;
 candidate correctness uses the default `bounded` expectation. The bound case
 schedules release after 130 seconds and releases earlier if the waiter finishes;
-the child-only helper has a longer safety timeout. The publication case waits
-for the scheduler's actual park before starting its 250 ms release timer, then
-checks the matching request/checkpoint release before its deadline and a disk
-restore. These checks stay outside hosted CI and the routine API suites.
+the child-only helper has a longer safety timeout. The bound waiter re-prefills
+from the deepest checkpoint it can restore. When RAM is tight, that can be a
+shallow seed on disk, so the waiter must match the cold answer and reasoning
+mode, not the full reasoning text. The retry must still match cold exactly. The
+publication case waits for the scheduler's actual park before starting its
+250 ms release timer, then checks the matching request/checkpoint release before
+its deadline and a disk restore. These checks stay outside hosted CI and the
+routine API suites.
+
+PR #677's staging-reclamation regression reuses this runner with `--case reclaim`
+before `--`. It defaults to a 256 MiB RAM cache, requires a retained checkpoint
+to release RAM during the deep request, then verifies publication and restoration
+of the exact held 50K+ token checkpoint. It also checks the loaded speculative
+mode, actual draft work, fewer than 64 prefill tokens and output against a cold
+control. A run that never reclaims RAM fails rather than passing on disk use
+alone. For example:
+
+```sh
+nix develop -c python3 tests/functional/publication_wait.py \
+  --case reclaim --output /tmp/publication-reclaim \
+  --fault-library build/cpu-test/libcache_disk_faults.so -- \
+  /path/to/production/gufo serve llm --model /path/to/flash-next.gguf \
+  --mtp-model /path/to/mtp.gguf --speculative mtp --sessions 1 --context 65536
+```
 
 Unchanged retries must reproduce the complete output with zero prefill. After a
 restart, disk restores may re-prefill less than one 2048-token disk step;
@@ -641,3 +828,14 @@ The report retains every response and its per-request timings. Constrained
 requests must propose zero drafts; the plain MTP control must propose drafts.
 Retain both ranks' server logs alongside the report to verify the loaded mode
 and rank agreement.
+
+`embedding_images.py` checks typed text/image `/v1/embeddings` requests against
+the official float32 image fixtures, including mixed batches, multiple images,
+the Frigate trailing newline, base64 dimensions, concurrency, PNG/WebP decoding,
+invalid image destinations and recovery. It requires Pillow and numpy and stays
+outside `--suite all`:
+
+```sh
+nix develop -c python3 tests/functional/embedding_images.py \
+  --base-url http://127.0.0.1:8080/v1 --output /tmp/image-embeddings.json
+```

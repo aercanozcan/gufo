@@ -249,7 +249,21 @@ SpeculativeVerifier::SpeculativeVerifier(
     : owned_target_executor_(
           std::make_unique<QwenGpuSpeculativeTarget>(target_executor)),
       target_executor_(owned_target_executor_.get()),
-      draft_backend_(std::move(draft_backend)),
+      owned_draft_backend_(std::move(draft_backend)),
+      draft_backend_(owned_draft_backend_.get()),
+      options_(options),
+      current_draft_length_(options_.initial_draft_tokens),
+      use_batched_verification_(options_.use_batched_verification) {
+  ConfigureAdaptiveDraftPolicy();
+}
+
+SpeculativeVerifier::SpeculativeVerifier(hip::QwenGpuExecutor& target_executor,
+                                         IDraftBackend& draft_backend,
+                                         SpeculativeOptions options)
+    : owned_target_executor_(
+          std::make_unique<QwenGpuSpeculativeTarget>(target_executor)),
+      target_executor_(owned_target_executor_.get()),
+      draft_backend_(&draft_backend),
       options_(options),
       current_draft_length_(options_.initial_draft_tokens),
       use_batched_verification_(options_.use_batched_verification) {
@@ -260,7 +274,8 @@ SpeculativeVerifier::SpeculativeVerifier(
     ISpeculativeTargetExecutor& target_executor,
     std::unique_ptr<IDraftBackend> draft_backend, SpeculativeOptions options)
     : target_executor_(&target_executor),
-      draft_backend_(std::move(draft_backend)),
+      owned_draft_backend_(std::move(draft_backend)),
+      draft_backend_(owned_draft_backend_.get()),
       options_(options),
       current_draft_length_(options_.initial_draft_tokens),
       use_batched_verification_(options_.use_batched_verification) {
@@ -459,14 +474,12 @@ SpeculativeVerifier::PreparedStep SpeculativeVerifier::PrepareStep(
     return prepared;
   auto& working_sampler =
       prepared.sampled ? *prepared.working_sampler : request.sampler;
-  prepared.proposal =
-      prepared.random_sampling
-          ? draft_backend_->ProposeSampled(request.sequence, request.position,
-                                           prepared.max_draft_tokens,
-                                           request.sampler.config().temperature,
-                                           working_sampler.mutable_rng_state())
-          : draft_backend_->Propose(request.sequence, request.position,
-                                    prepared.max_draft_tokens);
+  prepared.proposal = draft_backend_->ProposeForRequest(
+      {draft_backend_, request.sequence, request.position,
+       prepared.max_draft_tokens,
+       prepared.random_sampling ? request.sampler.config().temperature : 0.0F,
+       prepared.random_sampling ? working_sampler.mutable_rng_state() : nullptr,
+       &working_sampler});
   PrepareProposalVerification(prepared, request, defer_target_only);
   return prepared;
 }
@@ -780,11 +793,14 @@ SpeculativeVerifier::ProcessVerificationChunk(
         std::span<const tokenization::TokenId>(verification_inputs.data(),
                                                committed_input_count),
         cur_pos);
+    target_executor_->FinishVerification();
   }
 
   StepResult result;
   result.draft_count = num_draft;
   result.accepted_count = accepted_count;
+  result.lookup_tokens = proposal.from_lookup ? num_draft : 0;
+  result.lookup_accepted_tokens = proposal.from_lookup ? accepted_count : 0;
   result.emitted_tokens.insert(
       result.emitted_tokens.end(), proposal.tokens.begin(),
       proposal.tokens.begin() + static_cast<std::ptrdiff_t>(accepted_count));
@@ -854,10 +870,11 @@ std::vector<SpeculativeVerifier::StepResult> SpeculativeVerifier::VerifyBatch(
       auto& sampler = step.sampled ? *step.working_sampler : request.sampler;
       draft_indices.push_back(prepared.size() - 1);
       draft_requests.push_back(
-          {verifier.draft_backend_.get(), request.sequence, request.position,
+          {verifier.draft_backend_, request.sequence, request.position,
            step.max_draft_tokens,
            step.random_sampling ? request.sampler.config().temperature : 0.0F,
-           step.random_sampling ? sampler.mutable_rng_state() : nullptr});
+           step.random_sampling ? sampler.mutable_rng_state() : nullptr,
+           &sampler});
     }
   }
   if (!draft_requests.empty()) {
@@ -1084,6 +1101,8 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySequentialStep(
   StepResult result;
   result.draft_count = num_draft;
   result.accepted_count = accepted_count;
+  result.lookup_tokens = proposal.from_lookup ? num_draft : 0;
+  result.lookup_accepted_tokens = proposal.from_lookup ? accepted_count : 0;
 
   // Build emitted tokens: accepted draft tokens + correction token
   for (std::size_t i = 0; i < accepted_count; ++i) {
@@ -1100,6 +1119,10 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySequentialStep(
       break;
     }
   }
+
+  // Replay restores the transaction's saved state. Close it only after the
+  // committed rows have been rebuilt, so this frontier can be retained.
+  target_executor_->FinishVerification();
 
   // 6. Update stats and notify backend
   stats_.total_draft_tokens += num_draft;

@@ -16,7 +16,8 @@ prompt caching.
 
 This is an exhaustive list of functionalities and features offered by the gufo cli, the mapping between features and flags is not documented here and should be discovered using the `--help` command to avoid divergences between the implementation and the documentation.
 
-The supported modalities are LLM, image, video, and audio (TTS, ASR).
+The supported model types are LLM, image, video, audio (TTS, ASR), and text embeddings.
+`gufo serve embedding` provides [EmbeddingGemma 2 text embeddings](SERVER.md#embeddings).
 `gufo serve image` provides [Qwen-Image-2.1 generation and editing](models/qwen-image-2.1/README.md).
 
 ### LLM or text
@@ -31,6 +32,9 @@ The supported modalities are LLM, image, video, and audio (TTS, ASR).
 
 - `context` — maximum context capacity; memory use depends on the model and
   the number of resident sessions.
+- `enableYarn` — Qwen3.8-Flash-Next only: allow a `context` above the native
+  262144 tokens through static YaRN, which applies to every request. Required
+  above 262144 and rejected at or below it.
 - `prefillChunk` — prompt tokens processed between active decode steps in
   HTTP serving. Model runtimes choose their own internal prefill batch sizes.
 - `maxTokens` — maximum number of tokens a request may generate. In practice:
@@ -82,14 +86,14 @@ The supported modalities are LLM, image, video, and audio (TTS, ASR).
 
 - `cacheDisk` — enable an on-disk cache of computed prompt state, reused
   across requests and restarts. In practice: repeated or shared prompts get
-  much faster; costs disk space. Give each Flash-Next server its own
-  directory: one Flash-Next server owns it, and a second one fails at
+  much faster; costs disk space. Give each Qwen27B or Flash-Next server its own
+  directory: one server owns it, and a second one fails at
   startup.
-- `cacheDiskBytes` — the maximum size of that cache on disk. Flash-Next also
-  counts unfinished writes, and lowering it removes its oldest checkpoints
+- `cacheDiskBytes` — the maximum size of that cache on disk. Qwen27B and Flash-Next also
+  count unfinished writes, and lowering it removes its oldest checkpoints
   (by creation) at the next start.
 - `cacheDiskStagingBytes` — RAM used to move cache entries to and from disk.
-  Flash-Next streams entries of any size through a 1 MiB buffer by default;
+  Qwen27B and Flash-Next stream entries of any size through a 1 MiB buffer by default;
   other models need it to hold a whole entry. See
   [the server guide](SERVER.md) for the defaults.
 
@@ -180,6 +184,19 @@ gufo serve tts \
   --voice-lang narrator_ita=italian
 ```
 
+### Embeddings
+
+Use `gufo serve embedding --model DIR` to serve the EmbeddingGemma 2 text embedding model, `google/embeddinggemma-2`, at `POST /v1/embeddings`.  The model has 768 dimensions, an 8192-token context, and BF16 weights.  The process loads one checkpoint and refuses to start when `DIR` is not an EmbeddingGemma 2 checkpoint.
+
+- `model` (`-m`) is the EmbeddingGemma 2 model directory
+- `servedModelName` is the model ID that clients send and `/v1/models` reports, `embeddinggemma-2` by default
+
+The command takes the shared server options but not `--sessions` or `--context`, because requests run one at a time on the GPU and the model fixes the context window.  The [server guide](SERVER.md#embeddings) lists the request fields, the limits, and the task prefixes the model expects.
+
+```sh
+gufo serve --port 8080 embedding --model ./models/embeddinggemma-2
+```
+
 ### Server options (all modalities)
 
 These apply to every modality, before or after the subcommand:
@@ -189,8 +206,9 @@ These apply to every modality, before or after the subcommand:
   port will not answer. Use `--host ::` to listen on IPv6 and IPv4 together.
 - `sessions` (`-j`) — preallocated GPU request sessions. In practice: more
   sessions means more requests can compute at once, at the cost of memory
-  per session. This option applies to LLM serving; image and speech servers
-  use their own bounded queues.
+  per session. This option applies to LLM serving; image and speech servers use
+  their own bounded queues. The embedding server serializes requests on a mutex
+  and is bounded by `--max-connections`.
 - `maxConnections` — maximum simultaneous HTTP connections. In practice:
   clients beyond the limit queue or are refused instead of piling up.
 - `maxRequestBytes` — maximum request body size. In practice: matters mostly

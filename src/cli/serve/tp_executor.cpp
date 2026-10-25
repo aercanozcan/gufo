@@ -663,6 +663,9 @@ TextRunnerDescriptor TpMirroredRunner::Descriptor() const {
   // An in-pass checkpoint would capture inside a call rank 1 cannot mirror
   // yet; the scheduler then splits the pass at the boundary and snapshots.
   descriptor.capabilities.in_pass_checkpoint = false;
+  // Rolling back an interrupted prefill needs the call to stop mid-pass,
+  // where rank 1 would be left inside an exchange; calls here always finish.
+  descriptor.capabilities.prefill_rollback = false;
   if (descriptor.persistence.has_value()) {
     // Rank 0's files hold its half and name rank 1's: neither a one-host
     // server nor a lone rank can restore them.
@@ -700,6 +703,14 @@ sampling::JsonConstraint::ToolFormat TpMirroredRunner::ToolFormat() const {
   return inner_->ToolFormat();
 }
 
+TextModelRunner::ReasoningTags TpMirroredRunner::ReasoningBudgetTags() const {
+  return inner_->ReasoningBudgetTags();
+}
+
+std::uint32_t TpMirroredRunner::VocabularySize() const {
+  return inner_->VocabularySize();
+}
+
 // Device probes are local to rank 0's GPU and exchange nothing with rank 1.
 TextModelRunner::DeviceProbeStatus TpMirroredRunner::PollDevice() const {
   return inner_->PollDevice();
@@ -714,6 +725,11 @@ std::vector<TextRunnerToken> TpMirroredRunner::Tokenize(
   return inner_->Tokenize(text);
 }
 
+std::vector<TextRunnerToken> TpMirroredRunner::TokenizeControl(
+    std::string_view text) const {
+  return inner_->TokenizeControl(text);
+}
+
 std::optional<std::vector<TextRunnerToken>> TpMirroredRunner::RenderAndTokenize(
     const ChatRequest& request) const {
   return inner_->RenderAndTokenize(request);
@@ -722,6 +738,11 @@ std::optional<std::vector<TextRunnerToken>> TpMirroredRunner::RenderAndTokenize(
 std::optional<TextPreparedPrompt> TpMirroredRunner::PreparePrompt(
     const ChatRequest& request) const {
   return inner_->PreparePrompt(request);
+}
+
+std::optional<std::size_t> TpMirroredRunner::CountPromptTokens(
+    const ChatRequest& request) const {
+  return inner_->CountPromptTokens(request);
 }
 
 void TpMirroredRunner::SetPromptContext(
@@ -824,6 +845,12 @@ void TpMirroredRunner::PreparePrefixReuse(
   });
 }
 
+// Rank 0's own gathers; rank 1 gathers the same rows for its state.
+TextRunnerNgramRows TpMirroredRunner::NgramRows(
+    const TextRunnerState& state) const {
+  return inner_->NgramRows(Mirrored(state).inner());
+}
+
 void TpMirroredRunner::PrepareBatchExecution(TextRunnerState& state) const {
   inner_->PrepareBatchExecution(Mirrored(state).inner());
 }
@@ -841,14 +868,23 @@ TextPrefillStep TpMirroredRunner::Prefill(
   // A budget beyond the remaining prompt means the same as the remaining
   // prompt, and fits the wire; both ranks prefill with the clamped value.
   const std::size_t count = std::min(max_input_tokens, prompt.size() - offset);
+  // The pool's lookahead continues the request prompt past this frontier, as
+  // rank 1's copy of it does, so its length is all rank 1 needs.
+  const auto lookahead = state.prefill_lookahead();
   const TpInstruction instruction{
       .op = TpInstructionOp::kPrefill,
       .state = mirrored.id(),
       .offset = ToWire(offset, "offset"),
       .count = ToWire(count, "budget"),
-      .prompt_size = ToWire(prompt.size(), "prompt")};
+      .prompt_size = ToWire(prompt.size(), "prompt"),
+      .lookahead = ToWire(lookahead.size(), "lookahead")};
   const auto sent = Send(mirrored.id(), instruction, prompt);
   TextPrefillStep step;
+  struct ClearLookahead {
+    TextRunnerState& state;
+    ~ClearLookahead() { state.SetPrefillLookahead({}); }
+  } clear_lookahead{mirrored.inner()};
+  mirrored.inner().SetPrefillLookahead(lookahead);
   try {
     CallScope scope(*this, sent.index);
     step = inner_->Prefill(mirrored.inner(), prompt, offset, count);
@@ -908,15 +944,24 @@ TextDecodeStep TpMirroredRunner::DecodeStep(
   auto& mirrored = Mirrored(state);
   const auto count = ToWire(max_tokens, "decode budget");
   const auto draw = sampler.SaveDrawState();
-  const auto sent = Send(mirrored.id(), {.op = TpInstructionOp::kDecode,
-                                         .state = mirrored.id(),
-                                         .count = count,
-                                         .rng = draw.rng,
-                                         .pending = PendingToWire(draw)});
+  // Rank 0's draft count fixes the cycle width on both ranks: rank 1's own
+  // acceptance history could choose another and meet the trunk forward with
+  // a different all-reduce size.
+  const auto plan = inner_->PlanDecodeStep(mirrored.inner(), count, sampler);
+  const auto sent =
+      Send(mirrored.id(),
+           {.op = TpInstructionOp::kDecode,
+            .state = mirrored.id(),
+            .count = count,
+            .rng = draw.rng,
+            .pending = PendingToWire(draw),
+            .drafts = plan.has_value()
+                          ? ToWire(std::size_t{*plan} + 1, "draft count")
+                          : 0});
   TextDecodeStep step;
   try {
     CallScope scope(*this, sent.index);
-    step = inner_->DecodeStep(mirrored.inner(), count, sampler);
+    step = inner_->DecodeStepPlanned(mirrored.inner(), count, sampler, plan);
     scope.End();
   } catch (...) {
     Record(sent.sequence, DigestTpFailure);
@@ -960,6 +1005,20 @@ std::vector<TextDecodeStep> TpMirroredRunner::DecodeBatch(
   const auto plan = inner_->PlanDecodeBatch(inner);
   instruction.batch_drafts =
       plan.has_value() ? ToWire(std::size_t{*plan} + 1, "draft count") : 0;
+  if (!plan.has_value()) {
+    // A batch without a shared plan (a sampled one) takes each member's own
+    // draft count; rank 0 chooses them and both ranks run the same widths.
+    for (std::size_t index = 0; index < inner.size(); ++index) {
+      const auto member_plan = inner_->PlanDecodeStep(
+          inner[index].state.get(), inner[index].max_tokens,
+          inner[index].sampler.get(), inner.size());
+      instruction.batch[index].drafts =
+          member_plan.has_value()
+              ? ToWire(std::size_t{*member_plan} + 1, "draft count")
+              : 0;
+      inner[index].drafts = member_plan;
+    }
+  }
   const auto sent = SendBatch(instruction);
   std::vector<TextDecodeStep> steps;
   try {
@@ -1354,8 +1413,7 @@ struct TpExecutor::Request {
           const sampling::SamplingConfig& sampling,
           std::vector<TextRunnerToken> tokens, std::size_t states)
       : prompt(std::move(tokens)),
-        greedy(begin.sampling.can_use_unmodified_argmax() &&
-               !begin.constrained),
+        greedy(sampling.can_use_unmodified_argmax() && !begin.constrained),
         stop_at_eos(begin.stop_at_eos),
         sampler(sampling, prompt),
         own(states) {}
@@ -1405,6 +1463,10 @@ TpExecutor::TpExecutor(std::shared_ptr<TextModelRunner> runner,
     }
     states_.push_back(std::move(state));
   }
+  // Rank 0's scheduler prepares its vocabulary before serving; rank 1 would
+  // otherwise build its own inside the first constrained request, while rank 0
+  // waits for it in the request's first exchange.
+  (void)runner_->PrepareConstraintVocabulary();
 }
 
 TpExecutor::~TpExecutor() = default;
@@ -1454,8 +1516,11 @@ bool TpExecutor::EndScope(std::uint64_t index, std::string* error) {
 }
 
 void TpExecutor::DropSnapshot(std::uint64_t id) {
-  if (id == 0 || id > last_snapshot_id_)
+  if (id == 0)
     throw std::logic_error("unknown snapshot drop ID");
+  // Rank 0 drops the ID of a capture that failed before this rank recorded
+  // it: retire the ID so that rank 0 cannot reuse it.
+  last_snapshot_id_ = std::max(last_snapshot_id_, id);
   const auto found = snapshots_.find(id);
   if (found != snapshots_.end()) {
     snapshot_bytes_ -= found->second->PayloadBytes();
@@ -1523,7 +1588,8 @@ bool TpExecutor::Open(const TpControlCommand& begin, std::string* error) {
     }
     prompt.push_back(static_cast<TextRunnerToken>(token));
   }
-  // A constraint rank 1 cannot rebuild fails the request, not the pair.
+  // A constraint or reasoning budget rank 1 cannot rebuild fails the request,
+  // not the pair.
   auto sampling = begin.sampling;
   std::string constraint_error;
   if (begin.constraint_source) {
@@ -1534,11 +1600,18 @@ bool TpExecutor::Open(const TpControlCommand& begin, std::string* error) {
       constraint_error = exception.what();
     }
   }
+  if (begin.reasoning_budget) {
+    sampling.reasoning_budget =
+        runner_->BuildReasoningBudget(*begin.reasoning_budget, prompt);
+  }
   auto request = std::make_unique<Request>(begin, sampling, std::move(prompt),
                                            states_.size());
   if (!constraint_error.empty()) {
     request->Note("rank 1 could not rebuild the request's constraint: " +
                   constraint_error);
+  }
+  if (begin.reasoning_budget && sampling.reasoning_budget == nullptr) {
+    request->Note("rank 1 could not rebuild the request's reasoning budget");
   }
   if (!begin.prompt_context.empty()) {
     // A context rank 1 cannot rebuild fails the request, not the pair: its
@@ -1611,13 +1684,13 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
       case TpInstructionOp::kSnapshot: {
         if (instruction.snapshot_id <= last_snapshot_id_)
           throw std::logic_error("reused snapshot ID");
+        last_snapshot_id_ = instruction.snapshot_id;
         // Rank 0 sent the request's calls so far: capture only a state both
         // ranks reached the same way, so the snapshot is reusable at once.
         if (instruction.count != request.count ||
             instruction.digest != request.digest.value() ||
             !request.failure.empty())
           throw std::runtime_error("the ranks diverged before this capture");
-        last_snapshot_id_ = instruction.snapshot_id;
         const auto estimate = runner_->SnapshotPayloadBytes(state);
         if (estimate > snapshot_budget_ - snapshot_bytes_)
           throw std::runtime_error("worker snapshot budget exhausted");
@@ -1680,6 +1753,16 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
           throw std::invalid_argument("prefill exceeds the request prompt");
         }
         choice.reset();
+        struct ClearLookahead {
+          TextRunnerState& state;
+          ~ClearLookahead() { state.SetPrefillLookahead({}); }
+        } clear_lookahead{state};
+        state.SetPrefillLookahead(
+            std::span<const TextRunnerToken>(request.prompt)
+                .subspan(instruction.prompt_size)
+                .first(std::min<std::size_t>(
+                    instruction.lookahead,
+                    request.prompt.size() - instruction.prompt_size)));
         const auto step = runner_->Prefill(
             state, prefill_prompt, instruction.offset, instruction.count);
         DigestTpPrefill(request.digest, step,
@@ -1715,8 +1798,13 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
         choice.reset();
         request.sampler.RestoreDrawState(
             DrawFromWire(instruction.rng, instruction.pending));
-        const auto step =
-            runner_->DecodeStep(state, instruction.count, request.sampler);
+        // Rank 0's draft count, which it chose from its own history.
+        const auto plan =
+            instruction.drafts != 0
+                ? std::optional<std::uint32_t>(instruction.drafts - 1)
+                : std::nullopt;
+        const auto step = runner_->DecodeStepPlanned(state, instruction.count,
+                                                     request.sampler, plan);
         for (const auto& selection : step.selections) {
           request.sampler.Accept(selection.token);
         }
@@ -1800,9 +1888,13 @@ bool TpExecutor::ExecuteBatch(const TpInstruction& instruction,
       choice.reset();
       request.sampler.RestoreDrawState(
           DrawFromWire(member.rng, member.pending));
-      decodes.push_back({.state = *states_[member.state],
-                         .max_tokens = member.count,
-                         .sampler = request.sampler});
+      decodes.push_back(
+          {.state = *states_[member.state],
+           .max_tokens = member.count,
+           .sampler = request.sampler,
+           .drafts = member.drafts != 0
+                         ? std::optional<std::uint32_t>(member.drafts - 1)
+                         : std::nullopt});
       continue;
     }
     const auto token = static_cast<TextRunnerToken>(member.token);
@@ -1874,16 +1966,25 @@ bool TpExecutor::ExecuteBatch(const TpInstruction& instruction,
                    " failed: " + what);
       continue;
     }
-    if (decode) {
-      for (const auto& selection : steps[index].selections) {
-        request.sampler.Accept(selection.token);
+    // As in ExecuteCall: a member whose constraint refuses the token fails
+    // its request, not the batch or the pair.
+    try {
+      if (decode) {
+        for (const auto& selection : steps[index].selections) {
+          request.sampler.Accept(selection.token);
+        }
+        DigestTpDecode(request.digest, steps[index],
+                       runner_->CheckpointPosition(state));
+      } else {
+        const auto token = static_cast<TextRunnerToken>(member.token);
+        request.sampler.Accept(token);
+        DigestTpAdvance(request.digest, runner_->CheckpointPosition(state));
       }
-      DigestTpDecode(request.digest, steps[index],
-                     runner_->CheckpointPosition(state));
-    } else {
-      const auto token = static_cast<TextRunnerToken>(member.token);
-      request.sampler.Accept(token);
-      DigestTpAdvance(request.digest, runner_->CheckpointPosition(state));
+    } catch (const std::exception& exception) {
+      DigestTpFailure(request.digest);
+      request.Note("rank 1 " + std::string(OpName(instruction.op)) +
+                   " failed: " + exception.what());
+      continue;
     }
     if (request.greedy) {
       try {

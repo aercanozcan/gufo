@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -251,6 +252,23 @@ int main() {
     Require(got_sourced.constrained &&
                 got_sourced.constraint_source == sourced.constraint_source,
             "TP C1 command carries the constraint source exactly");
+    Require(!got_sourced.reasoning_budget && !got.reasoning_budget,
+            "TP C1 command carries no reasoning budget unless given one");
+
+    // Rank 1 rebuilds a reasoning budget from its token count, with or without
+    // a constraint source before it; a zero budget is a budget.
+    for (const bool with_source : {false, true}) {
+      TpControlCommand budgeted = with_source ? sourced : command;
+      budgeted.sequence = with_source ? 13 : 12;
+      budgeted.reasoning_budget = with_source ? 0 : 4096;
+      Require(server->SendCommand(budgeted, &server_error), server_error);
+      TpControlCommand got_budgeted;
+      Require(client->ReceiveCommand(&got_budgeted, &client_error),
+              client_error);
+      Require(got_budgeted.reasoning_budget == budgeted.reasoning_budget &&
+                  got_budgeted.constraint_source == budgeted.constraint_source,
+              "TP C1 command carries the reasoning budget exactly");
+    }
   }
 
   // An instruction is one model call for rank 1 to execute within the request
@@ -276,7 +294,8 @@ int main() {
                       .state = 1,
                       .offset = 512,
                       .count = 512,
-                      .prompt_size = 2054}};
+                      .prompt_size = 2054,
+                      .lookahead = 1024}};
   round_trip(prefill);
   round_trip(
       {.sequence = command.sequence,
@@ -289,7 +308,8 @@ int main() {
                               .index = 11,
                               .count = 8,
                               .rng = 0x0123456789abcdefULL,
-                              .pending = 248067}});
+                              .pending = 248067,
+                              .drafts = 5}});
   round_trip({.sequence = command.sequence,
               .kind = TpControlCommandKind::kInstruction,
               .instruction = {.op = TpInstructionOp::kEnd,
@@ -361,6 +381,11 @@ int main() {
                     {.sequence = command.sequence + 1, .state = 0, .count = 1}},
           .batch_drafts = 4}};
   round_trip(decode_batch);
+  // Without a shared plan, each member carries its own draft count instead.
+  auto member_plans = decode_batch;
+  member_plans.instruction.batch_drafts = 0;
+  member_plans.instruction.batch[0].drafts = 3;
+  round_trip(member_plans);
   // A capture carries the request's call count and digest so far.
   round_trip({.sequence = command.sequence,
               .kind = TpControlCommandKind::kInstruction,
@@ -460,6 +485,8 @@ int main() {
           with([](auto& bad) { bad.instruction.rng = 1; }));
   refuses("a pending draw outside a decode",
           with([](auto& bad) { bad.instruction.pending = 3; }));
+  refuses("a draft count outside a decode",
+          with([](auto& bad) { bad.instruction.drafts = 1; }));
   // Arguments that do not fit the operation.
   refuses("an empty prefill",
           with([](auto& bad) { bad.instruction.count = 0; }));
@@ -541,6 +568,11 @@ int main() {
           with_batch([](auto& bad) { bad.instruction.batch[0].count = 2; }));
   refuses("a draft plan outside a decode batch",
           with_batch([](auto& bad) { bad.instruction.batch_drafts = 2; }));
+  refuses("a batched advance member with a draft count",
+          with_batch([](auto& bad) { bad.instruction.batch[0].drafts = 1; }));
+  refuses("a member draft count beside a shared plan",
+          with_decode_batch(
+              [](auto& bad) { bad.instruction.batch[0].drafts = 2; }));
   refuses("members on a single advance", with([&](auto& bad) {
             bad.instruction = {.op = TpInstructionOp::kAdvance,
                                .token = 1,
@@ -551,6 +583,10 @@ int main() {
     bad.instruction = {.op = TpInstructionOp::kAdvance, .token = 1};
     refuses("an instruction on a request command", bad);
   }
+  refuses("a lookahead on an advance", with([](auto& bad) {
+            bad.instruction = {
+                .op = TpInstructionOp::kAdvance, .token = 1, .lookahead = 1};
+          }));
 
   TpControlResponse response{.sequence = received.sequence,
                              .tokens = {20, 21},
@@ -682,8 +718,52 @@ int main() {
                    [](TpControlConfig& config) { config.vision = true; });
   refuses_mismatch("disk cache",
                    [](TpControlConfig& config) { config.disk_cache = true; });
+  refuses_mismatch("YaRN", [](TpControlConfig& config) { config.yarn = true; });
   refuses_mismatch("context",
                    [](TpControlConfig& config) { config.max_context = 8192; });
+  refuses_mismatch("control token", [](TpControlConfig& config) {
+    config.auth_token = "other-token";
+  });
+
+  // Rank 0 accepts whoever connects first, so its hello must not carry the
+  // token: a stranger reads the hello, sends nothing and learns nothing.
+  {
+    const auto stranger_port = FreePort();
+    std::thread stranger([&] {
+      const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+      sockaddr_in address{};
+      address.sin_family = AF_INET;
+      address.sin_port = htons(stranger_port);
+      address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      for (int attempt = 0; attempt < 200; ++attempt) {
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&address),
+                      sizeof(address)) == 0) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      std::string received;
+      char buffer[4096];
+      // The hello is one frame: header and payload well under one buffer.
+      timeval timeout{.tv_sec = 2, .tv_usec = 0};
+      (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                         sizeof(timeout));
+      const auto bytes = ::recv(fd, buffer, sizeof(buffer), 0);
+      if (bytes > 0) {
+        received.assign(buffer, static_cast<std::size_t>(bytes));
+      }
+      ::close(fd);
+      Require(!received.empty(), "TP control stranger reads rank 0's hello");
+      Require(received.find(rank0.auth_token) == std::string::npos,
+              "TP control hello does not carry the control token");
+    });
+    auto stranger_server =
+        TpControlChannel::Listen(stranger_port, &server_error);
+    Require(stranger_server != nullptr, "TP control accepts the stranger");
+    Require(!stranger_server->Handshake(rank0, &server_error),
+            "TP control refuses a peer that never proves the token");
+    stranger.join();
+  }
 
   const auto broker_port = FreePort();
   std::shared_ptr<TpControlChannel> broker_client;

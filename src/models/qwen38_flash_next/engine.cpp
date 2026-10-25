@@ -56,7 +56,7 @@ struct SessionSnapshotHeader {
   std::uint32_t image_identity_bytes;
   std::uint32_t policy_concurrency;
   std::uint32_t reserved{0};
-  PromptLookup::State lookup;
+  speculative::PromptLookup<>::State lookup;
 };
 static_assert(std::is_trivially_copyable_v<SessionSnapshotHeader>);
 
@@ -129,6 +129,13 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     return nullptr;
   }
   m->weights_ = std::make_unique<ModelWeights>(std::move(*weights));
+  if (options.rope_scaling.has_value()) {
+    if (!ValidateRopeScaling(*options.rope_scaling,
+                             m->weights_->config.context_length, error_msg)) {
+      return nullptr;
+    }
+    m->weights_->config.rope_scaling = *options.rope_scaling;
+  }
   const Config& c = m->weights_->config;
   std::optional<distributed::TpPartition> partition;
   const distributed::TpPartition* partition_ptr = nullptr;
@@ -140,9 +147,10 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     }
     partition_ptr = &*partition;
   }
-  if (options.max_context == 0 || options.max_context > c.context_length) {
+  if (options.max_context == 0 || options.max_context > c.MaxContextLength()) {
     AssignError(error_msg, "context exceeds the model's " +
-                               std::to_string(c.context_length) + " tokens");
+                               std::to_string(c.MaxContextLength()) +
+                               " tokens");
     return nullptr;
   }
   // Under TP2 each rank runs the whole (replicated) vision encoder itself.
@@ -228,6 +236,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
         rocm::Executor::TwoRankSplitReduce(options.communicator, c.hidden_size);
   }
   exec.moe_observer = options.moe_observer;
+  exec.max_context = options.max_context;
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {
@@ -246,6 +255,17 @@ std::unique_ptr<Session> Model::CreateSession(core::SessionMode mode,
   auto native = executor_->CreateSession(mode, max_context, error_msg);
   if (!native) {
     return nullptr;
+  }
+  if (vision_) {
+    // Image-capable slots can first serve text. Prepare the stable RoPE
+    // descriptor before any graphs capture a null pointer: replacing it
+    // later destroys those graphs during image admission (5–12 ms here).
+    try {
+      native->PrepareVision(executor_->stream());
+    } catch (const std::exception& exception) {
+      AssignError(error_msg, exception.what());
+      return nullptr;
+    }
   }
   return std::unique_ptr<Session>(
       new Session(shared_from_this(), std::move(native)));
@@ -339,6 +359,10 @@ std::size_t Model::DeferredScratchBytes() const {
 
 std::size_t Session::AllocatedBytes() const noexcept {
   return session_->AllocatedBytes();
+}
+
+NgramTotals Session::NgramRowTotals() const noexcept {
+  return session_->NgramRowTotals();
 }
 
 bool Session::MtpEnabled() const noexcept {
@@ -574,7 +598,7 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
     AssignError(error_msg, "session snapshot draft policy is invalid");
     return false;
   }
-  if (!PromptLookup::Valid(header.lookup, header.token_count)) {
+  if (!speculative::PromptLookup<>::Valid(header.lookup, header.token_count)) {
     AssignError(error_msg, "session snapshot prompt-lookup state is invalid");
     return false;
   }
@@ -600,10 +624,17 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   valid_ = false;
   rocm::Executor::SnapshotInfo info;
   const auto remaining = ContextSize() - header.token_count;
-  const auto next_drafts =
-      MtpEnabled() ? restored_policy.Choose(remaining ? remaining - 1 : 0,
-                                            header.token_count)
-                   : 0;
+  auto next_drafts = MtpEnabled()
+                         ? restored_policy.Choose(remaining ? remaining - 1 : 0,
+                                                  header.token_count)
+                         : 0;
+  if (MtpEnabled() && model_->draft_subset_) {
+    // The next request's sampler/head is not known yet. Avoid discarding
+    // existing scratch that either eligible policy can use after restore.
+    next_drafts = std::max(next_drafts,
+                           restored_policy.Choose(remaining ? remaining - 1 : 0,
+                                                  header.token_count, 0, true));
+  }
   if (!model_->executor_->RestoreSnapshot(
           *session_,
           std::span<const std::uint8_t>(
@@ -695,6 +726,7 @@ bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
           *session_, replay, hidden_row,
           {.token = propose && candidates == nullptr ? &draft_token_ : nullptr,
            .candidates = candidates,
+           .kv_only = !propose,
            .draft_subset = draft_subset},
           error_msg)) {
     return false;
@@ -703,9 +735,14 @@ bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
 }
 
 bool Session::DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
-                                std::string* error_msg) {
+                                std::string* error_msg,
+                                std::span<const std::uint8_t> propose) {
   if (requests.empty())
     return true;
+  if (!propose.empty() && propose.size() != requests.size()) {
+    AssignError(error_msg, "draft catch-up head count differs from requests");
+    return false;
+  }
   auto& exec = *requests.front().session->model_->executor_;
   std::vector<std::vector<std::int32_t>> replays(requests.size());
   std::vector<rocm::Executor::MtpBatchItem> items;
@@ -719,7 +756,8 @@ bool Session::DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
       return false;
     if (replays[i].empty())
       continue;
-    items.push_back({session.session_.get(), replays[i], hidden_row});
+    items.push_back({session.session_.get(), replays[i], hidden_row,
+                     propose.empty() || !propose[i]});
   }
   return items.empty() || exec.MtpForwardBatch(items, error_msg);
 }
@@ -738,7 +776,21 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                : std::min<std::size_t>(model_->PrefillCapacity(), widest);
   };
   for (std::size_t off = 0; off < tokens.size();) {
-    const std::size_t n = chunk_size(tokens.size() - off);
+    const auto remaining = tokens.size() - off;
+    std::size_t n = chunk_size(remaining);
+    // Extended-context attention can fall back from WMMA to the per-token
+    // kernel. Its checkpoint must end a pass: the fused in-pass path requires
+    // WMMA for both query groups. Preserve ordinary split-pass arithmetic on
+    // either side of the boundary. Use the actual launch capability rather
+    // than the model's independently configured native context length.
+    if ((checkpoint || consume) && boundary > tokens_.size() &&
+        boundary < tokens_.size() + n &&
+        tokens_.size() + n >
+            rocm::WmmaCausalAttentionContextLimit(
+                model_->config().num_heads, model_->config().num_kv_heads,
+                model_->config().head_dim, model_->config().compress_ratio)) {
+      n = boundary - tokens_.size();
+    }
     const auto chunk = tokens.subspan(off, n);
     if (MtpEnabled() && !tokens_.empty() &&
         !DraftCatchUp(chunk[0], false, error_msg)) {
@@ -905,6 +957,7 @@ struct Session::PendingDecode {
   MtpCandidateLogits candidates;
   std::int32_t draft{0};
   bool draft_subset{false};  ///< this cycle drafts through the subset head
+  bool sampled_subset_cost{false};
   /// Trailing chain tokens copied by prompt lookup (after the MTP drafts).
   std::uint32_t lookup{0};
   /// Committed index the copied tokens were taken from.
@@ -912,6 +965,7 @@ struct Session::PendingDecode {
   /// Identical copy budget in isolated and batched execution; zero on the
   /// request's first speculative step.
   std::size_t lookup_cap{0};
+  std::uint32_t policy_concurrency{0};
 };
 
 void Session::AppendDraft(PendingDecode& pending) {
@@ -925,7 +979,7 @@ void Session::AppendDraft(PendingDecode& pending) {
 }
 
 bool Session::AppendLookup(PendingDecode& pending, bool stop_at_eos,
-                           std::size_t minimum) {
+                           std::size_t minimum, bool require_resume) {
   const auto cap = pending.lookup_cap;
   if (pending.chain.size() >= cap) {
     return false;
@@ -933,10 +987,11 @@ bool Session::AppendLookup(PendingDecode& pending, bool stop_at_eos,
   if (stop_at_eos && model_->IsStopToken(pending.chain.back())) {
     return false;
   }
-  const auto match =
-      lookup_.Find(tokens_, pending.chain,
-                   pending.sampled ? PromptLookup::kSampledMinMatch
-                                   : PromptLookup::kMinMatch);
+  const auto match = lookup_.Find(
+      tokens_, pending.chain,
+      pending.sampled ? speculative::PromptLookup<>::kSampledMinMatch
+                      : speculative::PromptLookup<>::kMinMatch,
+      require_resume);
   if (match.length == 0) {
     return false;
   }
@@ -973,7 +1028,8 @@ bool Session::AppendLookup(PendingDecode& pending, bool stop_at_eos,
 bool Session::PrepareDecode(const DecodeRequest& request,
                             PendingDecode* pending, std::string* error_msg,
                             bool defer_head,
-                            std::optional<std::uint32_t> batch_drafts) {
+                            std::optional<std::uint32_t> batch_drafts,
+                            std::uint32_t occupancy) {
   const auto max_tokens = request.max_tokens;
   auto& sampler = *request.sampler;
   auto* result = request.result;
@@ -992,24 +1048,29 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const std::size_t room = ContextSize() - tokens_.size();
   const std::size_t cap =
       std::min<std::size_t>({max_tokens, room, exec.max_speculative()});
-  const auto concurrency = model_->DecodeConcurrency();
-  // C1 sampled requests use the subset, including penalties and constraints;
-  // verification corrects their proposals against the full target distribution.
-  // Greedy penalties/constraints retain the full head. Unplanned multi-session
-  // requests also retain it so changed proposal chains cannot delay peers.
-  // Every request keeps the established length controller and AR backoff.
-  const bool unmodified = !sampler.config().uses_random_sampling() &&
-                          !sampler.config().penalties_enabled() &&
-                          !sampler.config().constraint;
-  const bool allow_subset =
-      (unmodified && (concurrency == 1 || batch_drafts.has_value())) ||
-      (concurrency == 1 && sampler.config().uses_random_sampling());
+  // Head eligibility is MtpDraftSubsetAllowed. Sampled cohorts are never
+  // jointly planned (DecodeBatchImpl), so a sampled request decides the same
+  // way alone and in any batch. A greedy request decoding alone has no
+  // peers to delay, so it drafts as on one session. Every request keeps the
+  // established length controller and AR backoff.
+  const bool allow_subset = MtpDraftSubsetAllowed(
+      sampler.config().uses_random_sampling(), model_->DecodeConcurrency(),
+      occupancy, batch_drafts.has_value());
+  pending->policy_concurrency = MtpPolicyConcurrency(
+      sampler.config().uses_random_sampling(), sampler.config().seed >= 0,
+      batch_drafts.has_value(), occupancy);
+  // A forced draft count (a TP2 rank 0's mirrored choice, made by PlanDecode
+  // at the same price) overrides the session's own acceptance-history policy,
+  // so both ranks run cycles of the same width even when their histories
+  // have drifted apart.
+  const auto& forced = request.drafts ? request.drafts : batch_drafts;
   const std::size_t width =
       MtpEnabled() && cap > 1
-          ? 1 + (batch_drafts ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
-                              : draft_length_.Choose(
-                                    static_cast<std::uint32_t>(cap - 1),
-                                    static_cast<std::uint32_t>(tokens_.size())))
+          ? 1 + (forced ? std::min<std::uint32_t>(*forced, cap - 1)
+                        : draft_length_.Choose(
+                              static_cast<std::uint32_t>(cap - 1),
+                              static_cast<std::uint32_t>(tokens_.size()),
+                              pending->policy_concurrency))
           : cap;
   if (width == 0) {
     result->stop = true;
@@ -1033,7 +1094,8 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const std::uint32_t base = static_cast<std::uint32_t>(tokens_.size());
   const bool sampled = sampler.config().uses_random_sampling();
   const bool gpu_greedy = sampler.config().temperature == 0.0F;
-  const bool gpu_verification = gpu_greedy;
+  const bool gpu_verification =
+      gpu_greedy || rocm::Executor::CanCompactMtpVerification(sampler);
   // A cycle-local proposal stream needs no pending RNG state in snapshots.
   // Target verification keeps its own draws after this independent seed.
   pending->draft_rng =
@@ -1054,17 +1116,17 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   }
   // Both execution paths use the same request-local copy rule. Scheduling
   // a peer must not change a sampled request's proposals or RNG sequence.
-  // A request's first speculative step copies nothing (see PromptLookup).
+  // A request's first speculative step copies nothing (see
+  // speculative::PromptLookup<>).
   pending->lookup_cap = lookup_.Step(base) ? cap : 0;
   if (pending->lookup_cap != 0) {
     lookup_.Extend(tokens_, sampled);
   }
-  // Greedy copies can supply the whole chain without the neural head.
-  // Sampled requests first extend with a neural proposal: a repeated prefix
-  // alone does not predict the continuation well enough at temperature.
-  // Replacing that proposal regressed an identical Pi code write by 9%.
-  // They still append copies below, after a neural proposal extends the match.
-  if (!sampled && AppendLookup(*pending, stop_at_eos, 3)) {
+  // A sampled copy can skip the neural head only after an accepted copy
+  // established its source and a full sampled match still holds. New or
+  // short matches retain the neural proposal: replacing it based only on
+  // shared syntax previously regressed an identical Pi code write by 9%.
+  if (AppendLookup(*pending, stop_at_eos, 3, sampled)) {
     return defer_head || DraftCatchUp(anchor, false, error_msg);
   }
   if (allow_subset && !SyncDraftVocab(error_msg))
@@ -1073,6 +1135,22 @@ bool Session::PrepareDecode(const DecodeRequest& request,
                           draft_vocab_.Fits(anchor, [&](std::int32_t token) {
                             return model_->InDraftSubset(token);
                           });
+  // Wider verification slowed short resumed replies in matched controls.
+  // Keep the established costs within two blocks of the remaining budget.
+  // Full target rows (for example, active tool constraints) also keep their
+  // original costs; the smaller-head curve does not price their transfers.
+  pending->sampled_subset_cost =
+      sampled && gpu_verification && pending->draft_subset &&
+      std::min(max_tokens, room) > 2 * exec.max_speculative();
+  if (pending->sampled_subset_cost && !forced) {
+    // Price the head actually used, after vocabulary fallback and the copy
+    // bypass. The policy depends only on committed history, not timings. A
+    // forced count (a batch plan, or a TP2 rank 0's choice) stands: rank 1
+    // must run the width rank 0 chose, not one from its own history.
+    pending->width =
+        1 + draft_length_.Choose(static_cast<std::uint32_t>(cap - 1), base,
+                                 pending->policy_concurrency, true);
+  }
   if (!defer_head && !DraftCatchUp(anchor, true, error_msg,
                                    sampled ? &pending->candidates : nullptr,
                                    pending->draft_subset)) {
@@ -1080,7 +1158,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   }
   pending->draft = draft_token_;
   if (!defer_head) {
-    while (pending->chain.size() < width) {
+    while (pending->chain.size() < pending->width) {
       AppendDraft(*pending);
       if (stop_at_eos && model_->IsStopToken(pending->chain.back())) {
         pending->width = pending->chain.size();
@@ -1089,7 +1167,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       if (AppendLookup(*pending, stop_at_eos)) {
         break;
       }
-      if (pending->chain.size() < width &&
+      if (pending->chain.size() < pending->width &&
           !exec.MtpForward(
               *session_, std::span<const std::int32_t>(&pending->draft, 1), -1,
               {.token = sampled ? nullptr : &pending->draft,
@@ -1139,6 +1217,29 @@ bool Session::FinishDecode(const DecodeRequest& request,
   std::uint32_t keep = 1;
   std::optional<std::int32_t> correction;
   bool cpu_rows = false;
+  const auto download_remaining = [&](std::uint32_t first) {
+    verify_logits_.resize(exec.max_speculative() * vocab);
+    auto rows =
+        std::span(verify_logits_).subspan(first * vocab, (k - first) * vocab);
+    if (!exec.ReadVerificationRows(first, rows, error_msg))
+      return false;
+    cpu_rows = true;
+    return true;
+  };
+  std::array<std::span<const sampling::LogitCandidate>, kMaxMtpDraftTokens>
+      candidates{};
+  if (gpu_verification && !gpu_greedy) {
+    // Accepting the anchor may activate a tool grammar, reasoning budget,
+    // or exceed the bounded penalty workspace. Keep the complete-row path.
+    if (!rocm::Executor::CanCompactMtpVerification(sampler)) {
+      if (!download_remaining(0))
+        return false;
+    } else if (!exec.SampledMtpCandidates(std::span(candidates).first(k - 1),
+                                          sampler, std::span(chain).subspan(1),
+                                          error_msg)) {
+      return false;
+    }
+  }
   while (keep < k) {
     if (gpu_greedy && !cpu_rows) {
       const auto& prediction = greedy[keep - 1];
@@ -1152,12 +1253,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
         // forbidden argmax, download the remaining rows once and use exact
         // masked selection. Avoid one synchronization per rejected candidate.
         // SelectBatchLogits has already installed this session's row offset.
-        verify_logits_.resize(exec.max_speculative() * vocab);
-        auto rows = std::span(verify_logits_)
-                        .subspan((keep - 1) * vocab, (k - keep + 1) * vocab);
-        if (!exec.ReadVerificationRows(keep - 1, rows, error_msg))
+        if (!download_remaining(keep - 1))
           return false;
-        cpu_rows = true;
         continue;
       }
       if (is_stop(prediction.index)) {
@@ -1172,10 +1269,16 @@ bool Session::FinishDecode(const DecodeRequest& request,
       continue;
     }
     if (sampled) {
+      if (gpu_verification && !cpu_rows && sampler.NeedsConstraintMask() &&
+          !download_remaining(keep - 1))
+        return false;
       const auto verified =
-          VerifyMtpProposal(std::span<const float>(verify_logits_)
-                                .subspan((keep - 1) * vocab, vocab),
-                            proposals[keep - 1], sampler);
+          gpu_verification && !cpu_rows
+              ? VerifyMtpProposal(candidates[keep - 1], vocab,
+                                  proposals[keep - 1], sampler)
+              : VerifyMtpProposal(std::span<const float>(verify_logits_)
+                                      .subspan((keep - 1) * vocab, vocab),
+                                  proposals[keep - 1], sampler);
       const auto token = static_cast<std::int32_t>(verified.token);
       const bool accepted = verified.accepted;
       if (is_stop(token)) {
@@ -1232,8 +1335,9 @@ bool Session::FinishDecode(const DecodeRequest& request,
   const std::uint32_t observed = mtp_all ? keep - 1 : mtp_accepted;
   // A target stop ends the request; it does not classify the remaining
   // proposals as failed predictions.
-  draft_length_.Observe(observed,
-                        result->stop || mtp_all ? observed : mtp_drafts, base);
+  draft_length_.Observe(
+      observed, result->stop || mtp_all ? observed : mtp_drafts, base,
+      pending.policy_concurrency, pending.sampled_subset_cost);
 
   // The next call knows the next sampled anchor. Defer draft catch-up until
   // then, retaining this session's target hidden rows across interleaving.
@@ -1248,7 +1352,9 @@ bool Session::FinishDecode(const DecodeRequest& request,
 
 bool Session::DecodeStep(std::size_t max_tokens,
                          sampling::SamplerState& sampler, DecodeResult* result,
-                         std::string* error_msg, bool stop_at_eos) {
+                         std::string* error_msg, bool stop_at_eos,
+                         std::uint32_t occupancy,
+                         std::optional<std::uint32_t> forced_drafts) {
   if (continuation_hooks_)
     continuation_hooks_->BeforeExecution();
   if (!valid_) {
@@ -1257,9 +1363,11 @@ bool Session::DecodeStep(std::size_t max_tokens,
     return false;
   }
   valid_ = false;
-  const DecodeRequest request{this, max_tokens, &sampler, result, stop_at_eos};
+  const DecodeRequest request{this,        max_tokens, &sampler,     result,
+                              stop_at_eos, nullptr,    forced_drafts};
   PendingDecode pending;
-  if (!PrepareDecode(request, &pending, error_msg)) {
+  if (!PrepareDecode(request, &pending, error_msg, false, std::nullopt,
+                     occupancy)) {
     return false;
   }
   if (pending.chain.empty()) {
@@ -1283,6 +1391,37 @@ bool Session::DecodeStep(std::size_t max_tokens,
   return ok;
 }
 
+std::optional<std::uint32_t> Session::PlanDecode(
+    std::size_t max_tokens, const sampling::SamplerState& sampler,
+    std::uint32_t occupancy) const {
+  if (!valid_ || !MtpEnabled()) {
+    return std::nullopt;
+  }
+  const std::size_t room = ContextSize() - tokens_.size();
+  const std::size_t cap = std::min<std::size_t>(
+      {max_tokens, room, model_->executor_->max_speculative()});
+  if (cap <= 1) {
+    return std::nullopt;
+  }
+  // Priced as PrepareDecode prices an unplanned cycle. The head is chosen
+  // after the anchor is drawn, which only the cycle itself can do, so a
+  // sampled request that is eligible for the small head is planned on its
+  // curve; rank 1 runs the width chosen here instead of deciding its own.
+  const bool sampled = sampler.config().uses_random_sampling();
+  const bool gpu_verification =
+      sampler.config().temperature == 0.0F ||
+      rocm::Executor::CanCompactMtpVerification(sampler);
+  const bool subset_cost =
+      sampled && gpu_verification && model_->draft_subset_ &&
+      std::min(max_tokens, room) > 2 * model_->executor_->max_speculative();
+  return draft_length_.Choose(
+      static_cast<std::uint32_t>(cap - 1),
+      static_cast<std::uint32_t>(tokens_.size()),
+      MtpPolicyConcurrency(sampled, sampler.config().seed >= 0, false,
+                           occupancy),
+      subset_cost);
+}
+
 template<class Request>
 bool Session::RunIsolatedBatch(std::span<const Request> requests,
                                std::string* error_msg,
@@ -1294,7 +1433,7 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
   std::array<BatchOutcome, 8> outcomes{};
   std::array<std::uint64_t, 8> epochs{};
   std::array<sampling::SamplerState::DrawState, 8> draws{};
-  std::array<PromptLookup::State, 8> lookup_states{};
+  std::array<speculative::PromptLookup<>::State, 8> lookup_states{};
   std::vector<Request> active;
   active.reserve(requests.size());
   Model* model = nullptr;
@@ -1373,12 +1512,20 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
           session.lookup_.Restore(lookup_states[i]);
         }
         try {
-          if constexpr (std::is_same_v<Request, DecodeRequest>)
+          if constexpr (std::is_same_v<Request, DecodeRequest>) {
+            // The retry must run the cycle width the batch planned, or a
+            // TP2 peer's own policy could pick another and meet a different
+            // collective size.
+            const auto forced =
+                r.drafts ? r.drafts
+                         : (plan != nullptr ? *plan
+                                            : std::optional<std::uint32_t>{});
             outcome.completed =
                 session.DecodeStep(r.max_tokens, *r.sampler, r.result,
-                                   &outcome.error, r.stop_at_eos);
-          else
+                                   &outcome.error, r.stop_at_eos, 1, forced);
+          } else {
             outcome.completed = session.Evaluate(r.token, &outcome.error);
+          }
         } catch (const std::exception& exception) {
           outcome.error = exception.what();
         }
@@ -1453,8 +1600,14 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
                               std::string* error_msg) {
   if (requests.size() == 1) {
     const auto& r = requests.front();
-    r.outcome->completed = r.session->DecodeStep(
-        r.max_tokens, *r.sampler, r.result, &r.outcome->error, r.stop_at_eos);
+    // The forced draft count (a TP2 peer's plan) overrides this session's
+    // acceptance-history policy, exactly as in the batched path.
+    const auto forced =
+        r.drafts ? r.drafts
+                 : (plan != nullptr ? *plan : std::optional<std::uint32_t>{});
+    r.outcome->completed =
+        r.session->DecodeStep(r.max_tokens, *r.sampler, r.result,
+                              &r.outcome->error, r.stop_at_eos, 1, forced);
     return r.outcome->completed;
   }
   auto& exec = *requests.front().session->model_->executor_;
@@ -1473,8 +1626,9 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
   for (std::size_t i = 0; i < requests.size(); ++i) {
     const auto& r = requests[i];
     try {
-      if (!r.session->PrepareDecode(r, &pending[i], &r.outcome->error, true,
-                                    batch_drafts))
+      if (!r.session->PrepareDecode(
+              r, &pending[i], &r.outcome->error, true, batch_drafts,
+              static_cast<std::uint32_t>(requests.size())))
         pending[i] = {};
     } catch (const std::exception& exception) {
       r.outcome->error = exception.what();
@@ -1482,11 +1636,15 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
     }
   }
   std::vector<AdvanceRequest> catchup;
+  std::vector<std::uint8_t> propose;
   for (std::size_t i = 0; i < requests.size(); ++i) {
-    if (!pending[i].chain.empty())
+    if (!pending[i].chain.empty()) {
       catchup.push_back({requests[i].session, pending[i].chain.front()});
+      propose.push_back(pending[i].speculative &&
+                        pending[i].chain.size() < pending[i].width);
+    }
   }
-  if (!DraftCatchUpBatch(catchup, error_msg))
+  if (!DraftCatchUpBatch(catchup, error_msg, propose))
     return false;
   // Each round shares predictor projections across ready sessions.
   // Attention state, proposal distributions and RNG streams stay private.

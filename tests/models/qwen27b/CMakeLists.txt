@@ -12,10 +12,15 @@ function(add_qwen27b_test target source labels)
 endfunction()
 
 add_qwen27b_test(qwen27b_vision_test vision_test.cpp "cpu;vision;correctness")
+add_qwen27b_test(qwen27b_continuation_layout_test continuation_layout_test.cpp
+  "cpu;correctness")
 
 add_qwen27b_test(qwen_mtp_reference_test mtp_reference_test.cpp
   "cpu;mtp;external-model")
 if (ENGINE_ENABLE_HIP)
+  add_executable(qwen27b_continuation_adapter_test EXCLUDE_FROM_ALL
+    continuation_adapter_test.cpp continuation_fault.cpp)
+  target_link_libraries(qwen27b_continuation_adapter_test PRIVATE gufo_core ${CMAKE_DL_LIBS})
   add_qwen27b_test(qwen_sampling_hip_test sampling_test.hip
     "hip;gpu;sampling;correctness")
   target_link_libraries(qwen_sampling_hip_test PRIVATE hip::host)
@@ -31,6 +36,11 @@ if (ENGINE_ENABLE_HIP)
   add_qwen27b_test(qwen_mtp_gpu_test mtp_test.cpp "gpu;hip;mtp;external-model")
   add_qwen27b_test(qwen_dflash_gpu_test dflash_test.cpp
     "gpu;hip;dflash;dflash2;external-model")
+  add_qwen27b_test(qwen_dflash_upload_lifetime_test
+    dflash_upload_lifetime_test.cpp "gpu;hip;dflash2;external-model")
+  target_link_libraries(qwen_dflash_upload_lifetime_test PRIVATE hip::host)
+  target_link_options(qwen_dflash_upload_lifetime_test
+    PRIVATE -Wl,--wrap=hipMemcpyAsync)
   add_qwen27b_test(qwen_dflash_noncausal_attention_ops_test attention_test.cpp
     "gpu;hip;dflash;dflash2;kernels")
   target_link_libraries(qwen_dflash_noncausal_attention_ops_test PRIVATE hip::host)

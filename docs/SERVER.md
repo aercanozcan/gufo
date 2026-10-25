@@ -74,6 +74,7 @@ Text serving defaults match llama.cpp for context and generation length:
 | Setting | Default |
 | --- | --- |
 | `--context` | `0`: native context from model metadata, per session |
+| `--enable-yarn` | Off; Flash-Next requires it for `--context` above 262144 |
 | `--max-tokens` | `-1`: until EOS or remaining context is exhausted |
 | `--sessions` | `1` |
 | Thinking / reasoning effort | Enabled; Qwen `xhigh`, DeepSeek `high` |
@@ -171,6 +172,17 @@ configured ceiling. Sampled MTP proposals use p/q acceptance and residual
 correction; greedy verification follows target argmax. Draft and verification
 work can batch across ready requests. See the
 [Flash-Next benchmark and quality contract](models/qwen3.8-flash-next/BENCHMARKS.md).
+Flash-Next's native context is 262144. `--context` above it requires
+`--enable-yarn`, which enables static YaRN with factor context / 262144; the
+server refuses to start without the flag, and the flag is an error at or below
+262144. The factor applies to every request, including short ones; see the
+[measurements](https://github.com/gufo-org/gufo/pull/350#issuecomment-6323981940),
+the
+[opt-in proposal](https://github.com/gufo-org/gufo/pull/350#issuecomment-6323982386),
+the
+[accuracy check](https://github.com/gufo-org/gufo/pull/350#issuecomment-6234093998)
+and [Qwen3.8 Flash-Next](models/qwen3.8-flash-next/README.md) for the memory
+cost.
 
 Each model chooses its prefill chunk. `--prefill-chunk` limits prompt work
 between active decode rounds without changing a lone request's kernel policy.
@@ -198,12 +210,12 @@ movable pages, not GPU allocations. 27B also checks HIP free memory. A
 positive value sets a byte cap that may exceed the automatic budget, up to the
 available host RAM minus 4 GiB; the startup line reports both as
 `automatic_bytes` and `max_bytes`.
-On Flash-Next, the pinned disk staging buffer comes out of that ceiling, and
+On Qwen27B and Flash-Next, the pinned disk staging buffer comes out of that ceiling, and
 `max_bytes` excludes it. Other models' disk staging and temporary disk-save
 buffers are separate from this RAM budget.
 The 128 checkpoint records are independent of `--sessions`; more than one can
 belong to a conversation.
-Qwen3.8-Flash-Next pins pages for up to about 89% of its budget as captures
+Qwen27B and Qwen3.8-Flash-Next pin pages for up to about 89% of its budget as captures
 need them, about 1 GiB at a time, and keeps them; the rest covers cache metadata as
 it grows. The first step runs at startup and later ones on a background thread
 ahead of need. Each takes about 200 ms while the host has free pages and longer
@@ -214,6 +226,12 @@ Growth stops early while the host would keep less than 4 GiB available. The page
 tails and idle-session spill; there is no separate spill option.
 Other models allocate payloads only when captured. Under pressure, optional
 copies give way before another conversation's last useful checkpoint.
+
+Qwen27B uses component-cache slots in both AR and DFlash2 modes. A checkpoint
+includes target KV and recurrent state, image-prefix identity, sampled frontier
+and pending output tokens. DFlash2 also retains its independently positioned
+ring KV, pending target features and draft controller state. Completed prefill
+steps can be retained after cancellation. MTP is unsupported on Qwen27B.
 
 Prompt reuse is enabled by default; how the cache finds, retains and
 evicts that state is described in [the KV cache](KV-CACHE.md).
@@ -255,26 +273,26 @@ encoding scratch is still allocated per image.
 `SIGINT` and `SIGTERM` cancel active requests and drain accepted disk writes
 before exiting. `--cache-disk DIR` defaults to 8 GiB retained on disk.
 
-On Flash-Next, `--cache-disk-bytes` counts every file the cache manages,
+On Qwen27B and Flash-Next, `--cache-disk-bytes` counts every file the cache manages,
 including temporary files of unfinished writes and files a crash left
 unreferenced. Restarting with a lower budget removes those first, then the
 oldest checkpoints by creation order, until the directory fits; use history does not
-survive a restart. One Flash-Next server owns the directory: a second one fails
+survive a restart. One Qwen27B or Flash-Next server owns the directory: a second one fails
 at startup, after loading its model but before committing its RAM budget, with
 an ownership error naming the directory. The lock does not wait: a restarted
 server fails if its predecessor is still draining disk writes when the new one
 finishes loading its model. Other models do not take this lock.
 The first start on a directory written by an earlier release removes its old
 checkpoint files (`*.kvc`), and the cache refills as conversations run. Do not
-share a directory between Flash-Next and other models; Flash-Next removes
+share a directory with another model server; the component cache removes
 their checkpoint and temporary files too, including writes in progress.
-Flash-Next ignores `--cache-disk-staging-bytes` and logs
+Qwen27B and Flash-Next ignore `--cache-disk-staging-bytes` and logs
 `event=option_ignored`. Writes and restores stream each checkpoint through an
 internal 1 MiB pinned buffer, piece by piece; a larger buffer did not change
 restore or write speed and took pinned RAM and device heap from the cache and
-the sessions. Remove the option from Flash-Next command lines.
+the sessions. Remove the option from Qwen27B and Flash-Next command lines.
 
-For the other models, `--cache-disk-staging-bytes 0` (the default) selects the
+For DeepSeek, `--cache-disk-staging-bytes 0` (the default) selects the
 smaller of one eighth of available host RAM after model/session loading
 (including cgroup limits) and the disk budget. This bounds queued
 captures/writes and each disk read separately; it allocates nothing upfront.
@@ -283,8 +301,8 @@ Snapshots that exceed either limit are skipped with their required size and
 available budget logged; live conversation reuse remains available. Existing
 files that exceed the current staging limit are preserved subject to disk LRU
 eviction and can be reused after restarting with sufficient staging.
-Qwen27B at full context needs larger staging and `--cache-disk-bytes` limits;
-use the required size reported in the skip log.
+Qwen27B streams large checkpoints through the same fixed 1 MiB staging buffer;
+`--cache-disk-bytes` still needs to fit the retained checkpoints.
 
 For a focused cancellation check, run
 `python3 tests/functional/continuation.py --output /tmp/cache-check.json`
@@ -330,13 +348,13 @@ follows `--log-level` like the rest of the startup diagnostics; the
 | `serve llm` | 2 | 3 |
 | `serve tts` | 1 | 2 |
 | `serve asr` | 1 | 2 |
-| `serve image`, `serve video` | runtime default | up to 5 |
+| `serve image`, `serve video`, `serve embedding` | runtime default | up to 5 |
 
 Text and audio caps are measured to cost no throughput: `serve llm` is flat from
 the runtime default down to a single queue at one and at four concurrent
-requests, and both audio servers are flat within run-to-run noise. Image and
-video are unmeasured, so they keep the runtime default unless the device is too
-busy to hold it.
+requests, and both audio servers are flat within run-to-run noise. Image,
+video, and embedding are unmeasured, so they keep the runtime default
+unless the device is too busy to hold it.
 
 The cap is only ever lowered to fit the free slots, never raised to fill them,
 so a server's throughput does not depend on the order the servers started. A
@@ -452,7 +470,7 @@ cache snapshots. HTTP handlers do not implement model kernels.
 
 | Method | Path | Condition |
 | --- | --- | --- |
-| `POST` | `/v1/embeddings` | Not implemented (501) |
+| `POST` | `/v1/embeddings` | EmbeddingGemma 2 serving is configured with `gufo serve embedding`.  A text server answers 501, and other servers answer 404 |
 | `POST` | `/v1/audio/transcriptions` | An STT implementation is compiled and loaded |
 | `POST` | `/v1/audio/speech` | A TTS implementation is compiled and loaded |
 | `POST` | `/v1/images/generations` | Qwen-Image-2.1 image serving is configured |
@@ -604,6 +622,55 @@ active string storage after transfer and completion. Completed MP4s are probed
 for H.264/AAC codec, geometry, rates, duration, and A/V synchronization before
 atomic publication.
 
+## Embeddings
+
+EmbeddingGemma 2 (`google/embeddinggemma-2`) serves text and image embeddings from its own model process.  It is a 768-dimension, BF16, 8192-token-context encoder:
+
+```sh
+./result/bin/gufo serve --port 8080 embedding --model /persist/models/embeddinggemma-2
+```
+
+`--model` must name an EmbeddingGemma 2 checkpoint directory, and `--served-model-name` overrides the default model ID `embeddinggemma-2`.  The process refuses to start on any other directory and in a build without the HIP backend.  There is no `--sessions` or `--context` option, because requests share one encoder.  Concurrent requests take turns in arrival order, one device batch of up to 8,192 tokens per turn, so a short request waits for at most one batch of a long one.  Route this process through llama-swap when one public URL should offer embeddings alongside text, speech, or images.
+
+`POST /v1/embeddings` follows the OpenAI request shape:
+
+```json
+{
+  "model": "embeddinggemma-2",
+  "input": ["task: search result | query: how do I cook rice?",
+            "title: none | text: Rinse the rice, then simmer it covered."],
+  "encoding_format": "float",
+  "dimensions": 256
+}
+```
+
+The response holds one embedding per input in request order:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {"object": "embedding", "index": 0, "embedding": [0.0123, -0.0456, "..."]},
+    {"object": "embedding", "index": 1, "embedding": [0.0098, 0.0311, "..."]}
+  ],
+  "model": "embeddinggemma-2",
+  "usage": {"prompt_tokens": 41, "total_tokens": 41}
+}
+```
+
+- `input` is required.  It is a string or an array of 1 to 2048 strings or typed content objects.  The server rejects empty strings.  Token-array input, meaning integers or arrays of integers, is not supported and returns 400 `unsupported_input`, so send text.
+- `model` is optional.  When present it must equal the served model ID, or the request returns 404 `model_not_found`.
+- `encoding_format` is `float` by default or `base64`.  Base64 carries the little-endian float32 bytes of the vector, as OpenAI's SDKs expect.  The server writes floats with enough digits to round-trip a float32 exactly.
+- `dimensions` is optional and must be 128, 256, 512, or 768, which is the default.  Any other value returns 400 `invalid_dimensions`.  A smaller value keeps the leading components of the normalized vector, which is Matryoshka truncation, and renormalizes them to unit length.
+- `user` is accepted and ignored when it is a string, and a non-string `user` returns 400 `invalid_parameter_type`.  The server rejects other members with 400 `unsupported_field`.
+- Every vector is mean-pooled and L2-normalized, so the dot product of two vectors is their cosine similarity.
+- Each input may hold at most 8192 tokens, counting the `<bos>` and `<eos>` markers the tokenizer adds.  The server refuses longer inputs instead of truncating them, with 400 `context_length_exceeded`, and the message names the input index.  `usage.prompt_tokens` and `usage.total_tokens` count every token of every input, markers included.
+- Errors use the standard error object.  Other 400 codes are `too_many_images`, `invalid_image_input`, `parse_error`, `invalid_request_body`, `missing_input`, `empty_input`, `too_many_inputs`, `invalid_encoding_format`, and `invalid_parameter_type`.  A client disconnect returns 499 `cancelled`.  A failed encode returns 500 `embedding_failed`.  A service that is not ready returns 503 `embedding_service_unavailable`.  A GPU failure that the device probe confirms returns 503 `device_lost` and shuts the server down as described under [Lifecycle and limits](#lifecycle-and-limits).  The usual authentication, `--max-request-bytes`, and request logging apply.
+
+Typed items follow llama.cpp's form: `{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}},{"type":"text","text":"\n"}]}`. Each item produces one vector in the same space as text. Text parts retain their order and whitespace. PNG, JPEG and WebP use the existing image reader, including public-HTTPS checks and the shared 20 MiB / 15-second budget. Embeddings accept at most 32 images per request, 32 megapixels per image, and 32,768 pixels on either side. Image soft tokens and their markers count toward context and usage. The first image request loads the vision weights. See [image embeddings](models/embeddinggemma-2/README.md#images) for exact preprocessing and index migration. Audio/video content parts and the legacy `/embeddings` route are unsupported.
+
+**Task prefixes.** EmbeddingGemma 2 was trained with short task prefixes, and the server does not add them, so clients must.  Queries use `task: search result | query: {text}`, and documents use `title: none | text: {text}`, or `title: {title} | text: {text}` when a title is known.  Omitting the prefixes still works but lowers retrieval quality.  Embed a query and its documents with matching conventions.
+
 ## Internal Request Model
 
 Text endpoints use `ChatRequest` and `SamplingConfig` at the
@@ -649,8 +716,9 @@ association and output parts; the custom call's free-form `input` is retained
 as literal tool-history data. This does not enable custom-tool generation.
 Chat Completions also accepts `image_url` parts in `role:"tool"` content.
 Existing text-string outputs keep their prompt representation. Images remain
-unsupported in assistant/system/developer messages; only `detail:"auto"` is
-accepted, and file IDs and `input_file` parts remain unsupported.
+unsupported in assistant/system/developer messages. Image resolution is
+model-owned: `detail` accepts `auto`, `low`, `high` and `original`, and all of
+them behave as `auto`. File IDs and `input_file` parts remain unsupported.
 
 Responses report `incomplete` with reason `max_output_tokens` when generation
 hits its limit. Otherwise they report `completed`. `stream: true` sends typed
@@ -945,14 +1013,16 @@ Verify with `tests/functional/openai_sdk.py --suite tools`,
 
 ## Model Discovery
 
-`GET /v1/models` lists the configured text model and ready audio/video
-services. Entries provide `id`, `object`, `created` and `owned_by`; the text
+`GET /v1/models` lists the configured text model and ready audio, video,
+image, and embedding services. Entries provide `id`, `object`, `created` and `owned_by`; the text
 entry also provides `context_length` and `architecture.input_modalities`: `["text"]`
 for text-only serving or `["text", "image"]` when a vision encoder is loaded.
 Image support reflects the loaded projector, not the model name; launching a
 vision-capable model without its projector advertises text only. Audio/video
 entries describe their capability. Send the returned model ID in requests.
-Text requests naming another model return 404.
+Repeat `--served-model-name` to list the text model under several IDs; the
+first is primary, and responses report the ID the request named. Text
+requests naming another model return 404.
 
 ## Errors
 
@@ -1077,6 +1147,9 @@ loss permanent for the process:
   `{"status":"device_lost","error":{...,"code":"device_lost"}}`;
 - every text-backend `POST` route, including unimplemented stubs that would
   otherwise answer 501, returns 503 `device_lost` without reaching the device;
+- `gufo serve embedding` probes the same way after a failed device batch. It
+  logs `event=device_lost` once, and its failing and later `/v1/embeddings`
+  requests return 503 `device_lost`;
 - `gufo serve` logs `event=device_lost_shutdown`, runs the `SIGTERM` shutdown
   and exits with status 75 (`EX_TEMPFAIL`), also when an external `SIGTERM`
   stops it after the loss. Teardown can block on the dead device, so the
@@ -1168,8 +1241,19 @@ prompt, `n_prompt_tokens_cache` the tokens restored from cache, and
 `timings.prompt_n`. `next_token[0].n_decoded` counts generated tokens and
 `n_remain` the remaining token budget. Idle slots report zero counts and
 `n_remain` -1. `task_id` and `state` (0 idle, 1 processing) remain for older
-clients; `prompt` is always empty. `/props` metadata is a placeholder.
+clients; `prompt` is always empty.
 Slots and metrics are separate snapshots; requests can advance between polls.
+
+`GET /props` reports what a text server runs, in llama-server's shape, so
+llama-server tooling can record which model, build and settings answered it.
+`?model=` is accepted and not required. `model_alias` is the served model
+name, `model_path` is `--model`, `build_info`
+the version and revision `gufo --version` prints, `total_slots` the
+`--sessions` count, `default_generation_settings.n_ctx` the per-session context
+and `default_generation_settings.params` the sampling a request without
+sampling fields gets, with `n_predict` and `max_tokens` -1 when no default
+limit is set. `modalities.vision` is true only when a vision encoder
+loaded. Fields the server cannot report are omitted rather than sent as zero.
 
 Streaming terminal chunks always include llama.cpp-compatible `timings`, even
 without `stream_options.include_usage`. `prompt_n` counts newly processed

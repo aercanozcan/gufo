@@ -24,6 +24,10 @@ Start rank 0 first, and rank 1 within 30 s. `RANK0_ADDRESS` is where rank 1
 reaches rank 0's TCP bootstrap. Both ranks need the same model files and the
 same `--tp-control-token`, `--context`, `--prefill-chunk`, `--sessions`, MTP
 settings and `--mmproj` use; the handshake names any setting that differs.
+The ranks prove the token to each other by HMAC-SHA256 over fresh nonces, so
+it never crosses the network, and rank 0 answers only a peer that proved it.
+The channel is not encrypted (prompts cross it in the clear): keep the control
+port on a trusted link.
 
 ```sh
 # rank 0: public HTTP server
@@ -70,6 +74,44 @@ against 1892 tok/s and decoded at 32.6 against 34.5 tok/s; USB4 costs more
 CPU (several cores in kernel workers) and latency per exchange. The links
 must train at 2 × 20 Gb/s; check `rx_speed` and `rx_lanes` in
 `/sys/bus/thunderbolt/devices/*/` after plugging.
+
+#### Device windows over USB4
+
+The speedup needs the experimental driver mode of thunderbolt-ibverbs
+(branch `codex/gpu-verbs-checkpoint`, not the default), loaded on both hosts
+with `dmabuf_verbs=1 dmabuf_push_done=1 dmabuf_credits=1` (direct post is on by
+default there). With it a GPU window registers as a DMA-BUF, the receiver's
+posted windows arm SEND credits, and the sender skips the per-exchange PREPARE
+round trip. The stock driver refuses `ibv_reg_dmabuf_mr`, so Gufo logs
+`windows=host_write (ibv_reg_dmabuf_mr: Operation not supported)` and runs as
+before; the driver mode never changes results, only exchange latency.
+Both ranks must run the same Gufo build (bootstrap wire version 8) and agree on
+the driver mode, or the pair falls back to host windows.
+
+`qwen38_flash_next_tp_batched_probe --allreduce-bench N` times the exchange,
+checks every sum exactly and prints the transport. fuzzy/misty, two USB4
+cables, p50 of 1000 exchanges per size, alternating runs, all sums verified:
+
+| Rows | Host windows (write) | Device windows (send, credits, direct post) |
+| ---: | ---: | ---: |
+| 1 | 32.0 µs | 29.5 µs |
+| 2 | 41.8 µs | 31.8 µs |
+| 8 | 54.6 µs | 45.6 µs |
+| 512 | 1419 µs | 1316 µs |
+
+On the stock driver (host windows) with the final build, the same probe gave
+31.4, 40.9, 51.3 and 1443 µs on rank 0 (one run).
+
+End to end on the stock driver (host windows), Q8 MTP, greedy, an empty prompt
+cache per server start, three starts each of the branch and its base,
+alternating: all four short and all four long (4.9k to 12k tokens, 384-token
+answers) outputs equal the previous build's token for token. Median short
+decode was 41.3 to 45.4 tok/s on the branch against 42.3 to 45.8 on its base;
+a 3.2k-token prefill took 2.63 s on both (the first start of a session 2.93 s
+for the branch), and the four long prefills differed by less than run-to-run
+noise (for example 12k tokens: 8.47 to 8.76 s against 8.40 to 8.59 s, one base
+start 13.3 s). The deferred send completion and the yielding spins therefore
+cost nothing measurable on the host path.
 
 Three things that broke a boot-time setup (Ubuntu 26.04, rdma-core 61.0):
 
@@ -130,12 +172,23 @@ Limits:
   one host writes a native `<tool_call>` (logit 18.83 against 17.19 for the
   client markup `<`) and TP2 the client markup (17.68 against 18.49);
   `qwen38_flash_next_tp_probe --top N --prompt-file FILE` shows such a choice
-  on either.
+  on either. The `tool-parameter-order` suite's `messages_12` and
+  `responses_12_omitted` cases are another: after `<parameter=action>` the
+  model weighs `update`, which the suite expects, against `get` almost evenly.
+  One host scores `update` 25.27 and `get` 24.57, TP2's probe 24.35 and 23.79,
+  both with `list` far behind (21.7). Sampled at temperature 1 (100 requests
+  each) `messages_12` gives `update` with `completed` 54% and `get` 41% on one
+  host, 51% and 45% on TP2; the passing `chat_12` gives 64%/26% and 63%/30%.
+  The distributions agree within sampling error, so TP2 is not skewed; greedy
+  decoding only breaks a near tie, and the TP2 server breaks it toward `get`
+  although the probe's single-step prefill picks `update`.
 - Where TP2 is still behind one host (gaps to close, not design choices):
   - No in-pass prompt checkpoint (`PrefillThrough`): the last prefill pass
     stops at the checkpoint boundary and snapshots there.
     `tp_executor_test` fails when the TP2 wrapper turns off a runner
     capability that is not listed there as such a gap.
+  - No mid-pass prefill rollback (`prefill_rollback`; so far only Qwen 27B's
+    runner offers it): a cancelled prefill finishes its pass on both ranks.
   - A paired prefill chunk computes every row of the final layer, where one
     host skips the rows nothing reads.
 
@@ -167,10 +220,46 @@ header carries the call's scope, an ordinal and the byte count; a mismatch
 poisons the communicator. A sum of two operands keeps both ranks bit-identical;
 TP2 and one host differ by reduction order. HIP graphs are off under TP2.
 
+**Device windows.** When both ranks can register GPU memory with the RDMA
+device as a DMA-BUF (`ibv_reg_dmabuf_mr`), the three windows live in uncached
+device memory and each exchange is a SEND with immediate data into a receive
+the peer posted for that window, instead of a write into host memory. A window's
+receive is posted when its previous use has been read: when this rank sends
+the exchange two before the window's next use, after the add that last read it.
+The partial starts at the window (direct placement into GPU memory needs a
+page-aligned offset), so there is no header: the completion's length (padded to
+32 bytes) and an immediate derived from the call's scope and the exchange's
+ordinal replace the header's size and identity checks, and a mismatch poisons
+the communicator as before. The stage kernel writes the send window and the
+NIC reads it, and the NIC writes the receive window and the add reads it, with
+no cache between them; hence the uncached allocation.
+
+The ranks agree on the placement during the bootstrap and log it in
+`event=rdma_ready` as `windows=gpu_send`. If either rank's device refuses the
+registration, both keep the host windows and writes with immediate data of the
+sections above and log `windows=host_write (reason)`, for example
+`ibv_reg_dmabuf_mr: Operation not supported` on the stock USB4 driver. No option
+selects it. The bootstrap's wire version is 8: a rank running an older build
+refuses to pair, so **both hosts must run the same build**.
+
+**Waiting.** An exchange finishes when the peer's partial has arrived and this
+rank's *earlier* sends have completed, not its own: that completion follows the
+peer's acknowledgement (host windows) or placement report (device windows),
+both after the partial arrived. The send window is reused three exchanges
+later, after the next exchange has collected the completion, and a failed send
+fails that next exchange. The communicator's spin waits yield the CPU every 64
+iterations: a thread spinning on a core holds off the per-CPU kernel worker that
+finishes the USB4 driver's ring completions for a scheduler slice, which showed
+up as exchange tails of about 3 ms once direct placement removed the round trip
+before each send.
+
 **Prefill overlap.** A prefill step of up to 8,448 tokens runs as two trunk
 batches a layer apart (one batch under 384 tokens), so each batch's exchange
 crosses the link while the other computes; the results equal two steps of
-those sizes bit for bit.
+those sizes bit for bit. The split falls a multiple of 128 rows into the
+step: sparse attention groups four queries from the start of each batch, so
+a split elsewhere regroups them and changes the same prompt's logits with the
+pairing.
 
 **Rank 1 as executor.** Rank 0 runs the ordinary scheduler, runner pool and
 continuation cache through `TpMirroredRunner`. Just before each call that
@@ -182,12 +271,18 @@ configuration and prepared images) and closes with `kEnd`. Mirrored calls:
 
 - prefill chunks, single and batched advances, and single and batched
   multi-token MTP cycles. A cycle carries rank 0's sampler draw state so both
-  ranks draw alike; a batch also carries the draft count rank 0 chose from its
-  own cycle timings. A request with tools or a response format sends rank 1
+  ranks draw alike, and rank 0's draft count, so both ranks run cycles of the
+  same width even when their acceptance histories disagree; a greedy batch
+  carries one draft count for the whole batch, a sampled one each member's. A
+  request with tools or a response format sends rank 1
   what its constraint was built from (tools, response format, tool choice),
   and rank 1 builds the same constraint with the same code, so it judges
   drafts as rank 0 does; a constraint without that source decodes one token
-  at a time;
+  at a time. A request with a reasoning budget sends its token count, and rank
+  1 rebuilds the budget from it and the prompt, so both ranks force the same
+  reasoning end. A prefill chunk carries how many prompt tokens past it the
+  runner may read ahead, so both ranks prefetch the next chunk's n-gram rows
+  across cache checkpoints;
 - state resets, and binding a state to its request's prompt context (images
   can reset the state);
 - snapshot, restore, prefix reuse and cancellation preparation, each
@@ -246,14 +341,18 @@ ownership transitions are not yet mirrored by the control protocol. In-pass
 checkpoints remain disabled in the TP wrapper. Deferred MoE residual fusion
 stays on the single-host path, where it cannot bypass a required rank sum.
 
-The experimental DMA-BUF transport and configurable CQ spin budget are saved
-separately on `codex/wip-tp2-transport-experiments`; neither is part of this merge.
+The configurable CQ spin budget is saved separately on
+`codex/wip-tp2-transport-experiments` and is not part of this merge; the DMA-BUF
+device windows are ([Design](#design)).
 
 ## Tests and probes
 
 - `tp_control_test`, `tp_executor_test` (label `tp2`, in the CPU suite): the
   protocol, and the real scheduler and pool on rank 0 against an executor on
   rank 1 with a toy model, for every request kind, divergence and reuse rule.
+- `tp_disk_store_test` (labels `tp2`, `disk`, in the CPU suite): rank 1's
+  disk cache on its own: restart, rejected writes, foreign or corrupt files,
+  eviction by least-recent use and rewriting a key.
 - `qwen38_flash_next.tp_partition` and the attention, projection and routed
   operator tests: the split against the full kernels.
 - `qwen38_flash_next_tp_probe` (`gpu-tp2`): prompt, decode and logit
@@ -262,8 +361,17 @@ separately on `codex/wip-tp2-transport-experiments`; neither is part of this mer
   bit), `--decode-tail K` compares decoding the last K tokens with
   prefilling them.
 - `qwen38_flash_next_tp_batched_probe` (`gpu-tp2`): batched against serial
-  decoding on both ranks without the serving stack; `--allreduce-bench N`
-  times the exchange.
+  decoding on both ranks without the serving stack; `--prefill-chunk N` and
+  `--prefill-interleave` prefill as the serving pool does under concurrency;
+  `--allreduce-bench N` times the exchange.
+  Its `prefill_tokens_per_s` times a cold prefill straight after the model
+  load. The full Q8 checkpoint (176 GB) exceeds a host's 124 GB of RAM, so
+  the load leaves the PLE n-gram rows that prefill reads from the model file
+  out of the page cache. In many runs the first one or two 2048-token passes
+  then take about twice as long (2.5–2.7 s against 1.38 s) with the same rows
+  read, and the run reports 10–20% less; separate stalls reach 300 tok/s.
+  Compare builds by the median of runs alternating between them, not
+  by single runs. `model-bench.py` warms each server before its timed rows.
 - `tools/bench/model-bench.py` launches both ranks through a `gufo.tp2`
   overlay in `bench.json` (`remote_host`, `bootstrap_host`, ports, token,
   container and binary); it runs the single-user and users tables, with the

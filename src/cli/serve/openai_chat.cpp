@@ -297,12 +297,15 @@ bool ParseContent(const json::Value* content,
         *error = "image_url requires a user or tool message and a string URL";
         return false;
       }
-      // Resolution is model-owned; accept only the automatic policy rather
-      // than silently ignoring a requested low/high preprocessing policy.
+      // Resolution is model-owned. The standard detail values are accepted
+      // and all behave as 'auto', since clients such as Codex always send
+      // one; anything else is still a malformed request.
       const auto* detail = image->find("detail");
       if (detail != nullptr &&
-          (!detail->is_string() || detail->get_str() != "auto")) {
-        *error = "image_url.detail supports only 'auto'";
+          (!detail->is_string() ||
+           (detail->get_str() != "auto" && detail->get_str() != "low" &&
+            detail->get_str() != "high" && detail->get_str() != "original"))) {
+        *error = "image_url.detail must be 'auto', 'low', 'high' or 'original'";
         return false;
       }
       try {
@@ -821,7 +824,7 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
   if (output->model.empty()) {
     return Error(400, "Bad Request", "'model' is required", "missing_model");
   }
-  if (output->model != backend.model_id()) {
+  if (!backend.serves_model(output->model)) {
     return Error(404, "Not Found",
                  "model '" + output->model + "' is not served by this process",
                  "model_not_found");
@@ -1257,6 +1260,10 @@ std::string_view ContentBefore(std::string_view full, std::size_t begin,
       begin = cursor;
   }
   const auto slice = full.substr(begin, stop - begin);
+  // The newline a model writes between or after its calls is layout, not a
+  // reply: a turn of parallel calls would otherwise carry content "\n" (#673).
+  if (after_call && Trim(slice).empty())
+    return {};
   const bool adjacent_envelope =
       after_call && Trim(slice).starts_with(kEnvelopeHeads.front());
   if (const auto block = EnvelopeBlockStart(full, stop, begin, closers, tools,
@@ -2878,7 +2885,7 @@ HttpResponse NonStreamingResponse(
   response["id"] = RandomId("chatcmpl-");
   response["object"] = "chat.completion";
   response["created"] = Now();
-  response["model"] = backend.model_id();
+  response["model"] = request.model;
   json::Value choices = json::Value::array();
   json::Value choice = json::Value::object();
   choice["index"] = 0;
@@ -2924,7 +2931,7 @@ HttpResponse StreamingResponse(
     TextGenerationBackend::InitialOutputState initial_output_state) {
   const std::string id = RandomId("chatcmpl-");
   const long long created = Now();
-  const std::string model = backend.model_id();
+  const std::string model = request.model;
   const auto format = generation->ToolFormat();
   const auto markers = ToolMarkers(format);
   const auto closers = ToolClosers(format);
@@ -3727,7 +3734,8 @@ template<typename Output>
 HttpResponse CreateCompatibilityResponse(
     const HttpRequest& request, TextGenerationBackend& backend,
     const ChatRequest& chat, std::size_t max_tokens,
-    const sampling::SamplingConfig& sampling, bool stream) {
+    const sampling::SamplingConfig& sampling, bool stream,
+    std::string_view requested_model) {
   const auto initial = backend.initial_output_state(chat);
   auto generation = backend.start_chat(chat, max_tokens, sampling,
                                        request.is_cancelled, stream);
@@ -3737,7 +3745,10 @@ HttpResponse CreateCompatibilityResponse(
   auto stream_log = std::make_shared<HttpResponse::StreamLog>();
   auto timing = std::make_shared<std::string>();
   const auto run = [generation, initial, chat, markers, closers,
-                    model = backend.model_id(), stream_log,
+                    model = requested_model.empty()
+                                ? backend.model_id()
+                                : std::string(requested_model),
+                    stream_log,
                     timing](const HttpResponse::BodyWriter& writer) {
     Output output(model, writer, chat);
     bool started = false;
@@ -3874,9 +3885,9 @@ HttpResponse CreateOpenAiResponse(const HttpRequest& request,
                                   const ChatRequest& chat,
                                   std::size_t max_tokens,
                                   const sampling::SamplingConfig& sampling,
-                                  bool stream) {
+                                  bool stream, std::string_view model) {
   return CreateCompatibilityResponse<ResponsesOutput>(
-      request, backend, chat, max_tokens, sampling, stream);
+      request, backend, chat, max_tokens, sampling, stream, model);
 }
 
 HttpResponse CreateAnthropicMessage(const HttpRequest& request,
@@ -3884,9 +3895,9 @@ HttpResponse CreateAnthropicMessage(const HttpRequest& request,
                                     const ChatRequest& chat,
                                     std::size_t max_tokens,
                                     const sampling::SamplingConfig& sampling,
-                                    bool stream) {
+                                    bool stream, std::string_view model) {
   return CreateCompatibilityResponse<AnthropicOutput>(
-      request, backend, chat, max_tokens, sampling, stream);
+      request, backend, chat, max_tokens, sampling, stream, model);
 }
 
 HttpResponse HandleOpenAiChat(const HttpRequest& request,

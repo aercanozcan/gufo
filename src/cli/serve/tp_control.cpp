@@ -5,6 +5,10 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/rand.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -19,6 +23,7 @@
 #include <limits>
 #include <span>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -27,12 +32,16 @@ namespace gufo::server {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x54504331U;  // "TPC1"
-constexpr std::uint16_t kVersion = 19;         // requests and rank-1 executor
-                                               // instructions for concurrent
-                                               // requests
+constexpr std::uint16_t kVersion = 21;         // reasoning budgets, prefill
+                                               // lookahead, the control token
+                                               // proven by HMAC, and mirrored
+                                               // decode draft counts
 constexpr std::uint16_t kHello = 1;
 constexpr std::uint16_t kCommand = 2;
 constexpr std::uint16_t kResponse = 3;
+constexpr std::uint16_t kAuth = 4;
+constexpr std::size_t kNonceBytes = 32;
+constexpr std::size_t kMacBytes = 32;  // HMAC-SHA256
 // A request carries its images' pixels: up to 16 images of up to 16 MP each.
 constexpr std::size_t kMaxPayloadBytes = std::size_t{1} << 30;
 // Before the handshake a peer is not yet authenticated.
@@ -53,6 +62,24 @@ void SetError(std::string* error, std::string message) {
 
 std::string SystemError(const char* operation) {
   return std::string(operation) + ": " + std::strerror(errno);
+}
+
+/// Proves the control token without sending it: HMAC-SHA256 keyed by the token
+/// over the sender's rank and both ranks' fresh nonces, so a MAC answers only
+/// this connection and cannot be reflected back as the other rank's.
+bool ControlMac(const std::string& token, std::uint32_t sender,
+                std::span<const std::uint8_t> rank0_nonce,
+                std::span<const std::uint8_t> rank1_nonce,
+                std::array<std::uint8_t, kMacBytes>* mac) {
+  constexpr std::string_view kLabel = "gufo tp2 control v20";
+  std::vector<std::uint8_t> message(kLabel.begin(), kLabel.end());
+  message.push_back(static_cast<std::uint8_t>(sender));
+  message.insert(message.end(), rank0_nonce.begin(), rank0_nonce.end());
+  message.insert(message.end(), rank1_nonce.begin(), rank1_nonce.end());
+  unsigned int size = 0;
+  return HMAC(EVP_sha256(), token.data(), static_cast<int>(token.size()),
+              message.data(), message.size(), mac->data(), &size) != nullptr &&
+         size == kMacBytes;
 }
 
 /// Bounds blocking sends and pre-handshake receives, turns on TCP keepalive so
@@ -170,7 +197,8 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
          !command.client_id.empty() || !command.prompt_context.empty() ||
          !IsDefaultSampling(command.sampling) || command.constrained ||
          command.sampling.constraint != nullptr || !command.stop_at_eos ||
-         command.constraint_source.has_value();
+         command.constraint_source.has_value() ||
+         command.reasoning_budget.has_value();
 }
 
 [[nodiscard]] std::uint32_t FloatBits(float value) {
@@ -204,6 +232,11 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
     SetError(error, "TP instruction carries a draw state it does not use");
     return false;
   }
+  // Only a decode carries a draft count.
+  if (instruction.op != TpInstructionOp::kDecode && instruction.drafts != 0) {
+    SetError(error, "TP instruction carries a draft count it does not use");
+    return false;
+  }
   const bool snapshot_op = instruction.op == TpInstructionOp::kSnapshot ||
                            instruction.op == TpInstructionOp::kRestore ||
                            instruction.op == TpInstructionOp::kDrop ||
@@ -226,6 +259,11 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
     SetError(error, "TP instruction batch does not match its operation");
     return false;
   }
+  if (instruction.op != TpInstructionOp::kPrefill &&
+      instruction.lookahead != 0) {
+    SetError(error, "TP instruction carries a lookahead it does not use");
+    return false;
+  }
   bool valid = false;
   switch (instruction.op) {
     case TpInstructionOp::kAdvanceBatch:
@@ -238,11 +276,15 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
       for (std::size_t index = 0; valid && index < instruction.batch.size();
            ++index) {
         const auto& member = instruction.batch[index];
-        valid = member.sequence != 0 &&
-                (decode ? member.token == 0 && member.count != 0 &&
-                              member.pending >= -1
-                        : member.token >= 0 && member.count == 0 &&
-                              member.rng == 0 && member.pending == -1);
+        // A member's own draft count is the plan only when the batch, taken
+        // as greedy, has no shared one.
+        valid =
+            member.sequence != 0 &&
+            (member.drafts == 0 || (decode && instruction.batch_drafts == 0)) &&
+            (decode ? member.token == 0 && member.count != 0 &&
+                          member.pending >= -1
+                    : member.token >= 0 && member.count == 0 &&
+                          member.rng == 0 && member.pending == -1);
         // A decode batch draws with each member's own sampler.
         for (std::size_t previous = 0; valid && previous < index; ++previous) {
           valid = instruction.batch[previous].state != member.state &&
@@ -273,9 +315,11 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
       valid = only(false, false, false, false, false);
       break;
     case TpInstructionOp::kPrefill:
-      valid = only(false, true, true, true, false) && instruction.count != 0 &&
-              instruction.prompt_size > instruction.offset &&
-              instruction.prompt_size <= kMaxPromptTokens;
+      valid =
+          only(false, true, true, true, false) && instruction.count != 0 &&
+          instruction.prompt_size > instruction.offset &&
+          instruction.prompt_size <= kMaxPromptTokens &&
+          instruction.lookahead <= kMaxPromptTokens - instruction.prompt_size;
       break;
     case TpInstructionOp::kAdvance:
       valid = only(true, false, false, false, false) && instruction.token >= 0;
@@ -650,7 +694,11 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
     SetError(error, "TP control configuration is invalid");
     return false;
   }
-  auth_token_ = config.auth_token;
+  std::array<std::uint8_t, kNonceBytes> nonce{};
+  if (RAND_bytes(nonce.data(), static_cast<int>(nonce.size())) != 1) {
+    SetError(error, "TP control nonce generation failed");
+    return false;
+  }
   std::vector<std::uint8_t> payload;
   AppendU32(&payload, config.rank);
   AppendU32(&payload, config.world_size);
@@ -661,10 +709,11 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   AppendU32(&payload, config.sessions);
   AppendU32(&payload, config.vision ? 1U : 0U);
   AppendU32(&payload, config.disk_cache ? 1U : 0U);
+  AppendU32(&payload, config.yarn ? 1U : 0U);
   AppendU64(&payload, config.snapshot_budget_bytes);
-  AppendU32(&payload, static_cast<std::uint32_t>(config.auth_token.size()));
-  payload.insert(payload.end(), config.auth_token.begin(),
-                 config.auth_token.end());
+  // The hello is sent before the peer is authenticated, so it carries a nonce
+  // and never the token: the listening rank accepts whoever connects first.
+  payload.insert(payload.end(), nonce.begin(), nonce.end());
   if (!SendFrame(kHello, 0, payload, error)) {
     return false;
   }
@@ -690,9 +739,8 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   std::uint32_t sessions = 0;
   std::uint32_t vision = 0;
   std::uint32_t disk_cache = 0;
+  std::uint32_t yarn = 0;
   std::uint64_t snapshot_budget = 0;
-  std::uint32_t auth_size = 0;
-  std::string peer_token;
   if (!ReadU32(peer, &offset, &rank, error) ||
       !ReadU32(peer, &offset, &world, error) ||
       !ReadU32(peer, &offset, &context, error) ||
@@ -702,14 +750,14 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
       !ReadU32(peer, &offset, &sessions, error) ||
       !ReadU32(peer, &offset, &vision, error) ||
       !ReadU32(peer, &offset, &disk_cache, error) ||
+      !ReadU32(peer, &offset, &yarn, error) ||
       !ReadU64(peer, &offset, &snapshot_budget, error) ||
-      !ReadU32(peer, &offset, &auth_size, error) ||
-      auth_size > kMaxAuthTokenBytes || peer.size() - offset != auth_size) {
+      peer.size() - offset != kNonceBytes) {
     SetError(error, "TP control hello payload is invalid");
     return false;
   }
-  peer_token.assign(reinterpret_cast<const char*>(peer.data() + offset),
-                    auth_size);
+  const std::span<const std::uint8_t> peer_nonce(peer.data() + offset,
+                                                 kNonceBytes);
   // Name every setting the ranks disagree on: both must be started with the
   // same model options, and a bare mismatch leaves the operator guessing.
   std::string mismatch;
@@ -736,7 +784,49 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
           config.vision ? 1U : 0U, vision);
   differs(disk_cache != (config.disk_cache ? 1U : 0U),
           "disk cache (--cache-disk)", config.disk_cache ? 1U : 0U, disk_cache);
-  if (peer_token != auth_token_) {
+  differs(yarn != (config.yarn ? 1U : 0U), "YaRN (--enable-yarn)",
+          config.yarn ? 1U : 0U, yarn);
+  // Rank 1 proves the token first; rank 0 answers with its own proof only
+  // after checking it, and with an empty refusal otherwise, so a stranger
+  // that connects to rank 0 learns nothing about the token.
+  const std::span<const std::uint8_t> own_nonce(nonce);
+  const auto rank0_nonce = config.rank == 0 ? own_nonce : peer_nonce;
+  const auto rank1_nonce = config.rank == 0 ? peer_nonce : own_nonce;
+  std::array<std::uint8_t, kMacBytes> own_mac{};
+  std::array<std::uint8_t, kMacBytes> expected_mac{};
+  if (!ControlMac(config.auth_token, config.rank, rank0_nonce, rank1_nonce,
+                  &own_mac) ||
+      !ControlMac(config.auth_token, 1U - config.rank, rank0_nonce, rank1_nonce,
+                  &expected_mac)) {
+    SetError(error, "TP control token MAC failed");
+    return false;
+  }
+  const auto peer_proves = [&](const std::vector<std::uint8_t>& mac) {
+    return mac.size() == kMacBytes &&
+           CRYPTO_memcmp(mac.data(), expected_mac.data(), kMacBytes) == 0;
+  };
+  std::vector<std::uint8_t> peer_mac;
+  bool authenticated = false;
+  if (config.rank == 1) {
+    if (!SendFrame(kAuth, 0, {own_mac.begin(), own_mac.end()}, error) ||
+        !ReceiveFrame(kAuth, &sequence, &peer_mac, error)) {
+      return false;
+    }
+    authenticated = sequence == 0 && peer_proves(peer_mac);
+  } else {
+    if (!ReceiveFrame(kAuth, &sequence, &peer_mac, error)) {
+      return false;
+    }
+    authenticated = sequence == 0 && peer_proves(peer_mac);
+    std::vector<std::uint8_t> answer;
+    if (authenticated) {
+      answer.assign(own_mac.begin(), own_mac.end());
+    }
+    if (!SendFrame(kAuth, 0, answer, error)) {
+      return false;
+    }
+  }
+  if (!authenticated) {
     mismatch += std::string(mismatch.empty() ? "" : ", ") + "control token";
   }
   if (!mismatch.empty()) {
@@ -800,13 +890,15 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
     AppendU32(&payload, FloatBits(config.frequency_penalty));
     AppendU32(&payload, FloatBits(config.presence_penalty));
     // Request flags: bit 0 constrained decoding, bit 1 decoding past EOS,
-    // bit 2 the constraint's source follows.
+    // bit 2 the constraint's source follows, bit 3 the reasoning budget
+    // follows it.
     const auto& source = command.constraint_source;
     AppendU32(
         &payload,
         (command.constrained || config.constraint != nullptr || source ? 1U
                                                                        : 0U) |
-            (command.stop_at_eos ? 0U : 2U) | (source ? 4U : 0U));
+            (command.stop_at_eos ? 0U : 2U) | (source ? 4U : 0U) |
+            (command.reasoning_budget ? 8U : 0U));
     if (source) {
       AppendString(&payload, source->response_format_json);
       AppendU32(&payload, (source->response_format_responses ? 1U : 0U) |
@@ -820,6 +912,9 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
         AppendString(&payload, tool.parameters_json);
         AppendString(&payload, tool.definition_json);
       }
+    }
+    if (command.reasoning_budget) {
+      AppendU64(&payload, *command.reasoning_budget);
     }
   } else {
     const auto& instruction = command.instruction;
@@ -836,6 +931,8 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
     AppendU32(&payload, static_cast<std::uint32_t>(instruction.pending));
     AppendU64(&payload, instruction.file_key);
     AppendU32(&payload, instruction.batch_drafts);
+    AppendU32(&payload, instruction.lookahead);
+    AppendU32(&payload, instruction.drafts);
     AppendU32(&payload, static_cast<std::uint32_t>(instruction.batch.size()));
     for (const auto& member : instruction.batch) {
       AppendU64(&payload, member.sequence);
@@ -844,6 +941,7 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
       AppendU32(&payload, member.count);
       AppendU64(&payload, member.rng);
       AppendU32(&payload, static_cast<std::uint32_t>(member.pending));
+      AppendU32(&payload, member.drafts);
     }
   }
   return SendFrame(kCommand, command.sequence, payload, error);
@@ -939,7 +1037,7 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         !ReadU32(command_prompt_, &offset, &flags, error)) {
       return reject("TP control request sampling is truncated");
     }
-    if (flags > 7 || ((flags & 4U) != 0 && (flags & 1U) == 0)) {
+    if (flags > 15 || ((flags & 4U) != 0 && (flags & 1U) == 0)) {
       return reject("TP control request flags are invalid");
     }
     parsed.constrained = (flags & 1U) != 0;
@@ -977,6 +1075,11 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         }
       }
     }
+    if ((flags & 8U) != 0 &&
+        !ReadU64(command_prompt_, &offset, &parsed.reasoning_budget.emplace(),
+                 error)) {
+      return reject("TP control request reasoning budget is truncated");
+    }
     config.temperature = BitsFloat(temperature);
     config.top_k = static_cast<std::int32_t>(top_k);
     config.top_p = BitsFloat(top_p);
@@ -1008,6 +1111,8 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         !ReadU32(command_prompt_, &offset, &pending_bits, error) ||
         !ReadU64(command_prompt_, &offset, &instruction.file_key, error) ||
         !ReadU32(command_prompt_, &offset, &instruction.batch_drafts, error) ||
+        !ReadU32(command_prompt_, &offset, &instruction.lookahead, error) ||
+        !ReadU32(command_prompt_, &offset, &instruction.drafts, error) ||
         !ReadU32(command_prompt_, &offset, &batch_size, error) ||
         op > static_cast<std::uint32_t>(TpInstructionOp::kDecodeBatch) ||
         batch_size > kMaxBatchMembers) {
@@ -1025,7 +1130,8 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
           !ReadU32(command_prompt_, &offset, &member_token, error) ||
           !ReadU32(command_prompt_, &offset, &member.count, error) ||
           !ReadU64(command_prompt_, &offset, &member.rng, error) ||
-          !ReadU32(command_prompt_, &offset, &member_pending, error)) {
+          !ReadU32(command_prompt_, &offset, &member_pending, error) ||
+          !ReadU32(command_prompt_, &offset, &member.drafts, error)) {
         return reject("TP control instruction batch is truncated");
       }
       member.token = static_cast<std::int32_t>(member_token);

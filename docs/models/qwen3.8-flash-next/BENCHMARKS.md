@@ -1,13 +1,9 @@
 # Qwen3.8 Flash-Next benchmarks
 
-AMD Strix Halo `gfx1151`, 128 GB unified memory. Unsloth `UD-Q4_K_XL` target and
-shared-Q8_0 MTP sidecar; Gufo uses adaptive MTP. HTTP, greedy, thinking off.
-All Gufo tables measured October 18, 2026, with `fec4759d` and the
-validated host-memory and cache-stall fixes.
-Reference results remain unchanged from September 22–23.
-llama.cpp uses `b11069` for AR and `6fcaa16f` for MTP.
-
-Positive gain favors Gufo.
+AMD Strix Halo `gfx1151`, 128 GB unified memory. Unsloth `UD-Q4_K_XL` target
+with shared-Q8_0 MTP; adaptive drafting. HTTP, greedy, thinking off.
+Gufo `fec4759d` (October 18, 2026); llama.cpp `b11069` AR and `6fcaa16f` MTP
+(September 22–23). Positive gain favors Gufo.
 [Quality and measurement details](QUALITY.md#benchmark-method) · [Model identities](artifacts/model-identities.json)
 
 - [Single Strix Halo](#single-strix-halo): Gufo against llama.cpp.
@@ -16,12 +12,6 @@ Positive gain favors Gufo.
 
 ## Single Strix Halo
 
-Gufo single-user pp/tg: October 7, 2026 (`def2ed1e`), Performance power
-profile; concurrency, loading, memory and reference results: September 22–23.
-Concurrency uses the unchanged short-context attention path. llama.cpp uses
-`b11069` for AR and `6fcaa16f` for MTP.
-
-### Single user, autoregressive
 Gufo numerical regression checks pass; individual functional timing limits
 remain documented in [QUALITY.md](QUALITY.md). Historical llama.cpp MTP values are retained as requested:
 a separate check of that pin did not match its own AR output, so this review
@@ -37,7 +27,7 @@ repeat against current main; both observations remain included.
 Prior mixed MTP C2 repeats show two draft-controller trajectories (about 54
 and 60 tok/s, identical text), so its gain is not entirely attributable to lookup.
 
-## Single user, autoregressive
+### Single user, autoregressive
 
 Approximately pp2048 / tg128; depth is the cached prefix in tokens.
 Context capacities differ between engines; see the measurement details.

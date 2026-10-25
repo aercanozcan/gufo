@@ -27,11 +27,19 @@ that is correct for every model, including hybrid-recurrent ones. It costs the
 ability to trim a checkpoint: a saved snapshot can only be reused **whole**,
 and only when its tokens are an exact prefix of the new prompt.
 
-Qwen3.8-Flash-Next no longer uses this snapshot cache: it serves through the
-component cache of the [cache redesign](cache-redesign/RFC.md), whose options
-are described under [Flash-Next budgets](#flash-next-budgets). The rest of this
-document describes the snapshot cache that the other models still use; its
-Flash-Next descriptions and measurements predate the change.
+Qwen3.8-27B (AR and DFlash2) and Qwen3.8-Flash-Next serve through the
+component cache of the [cache redesign](cache-redesign/RFC.md). Its backing
+and disk options are described under [component-cache budgets](#component-cache-budgets).
+Qwen27B retains target KV, convolution and recurrent state, image identity,
+sampled frontier and pending output tokens. DFlash2 adds private ring KV with
+its own injected frontier, pending target features and draft controller state.
+Borrowed target KV rows are preserved before mutation or rollback; private
+frontiers are captured into committed host backing. Disk transfers use fixed
+1 MiB staging regardless of checkpoint size.
+
+The snapshot-cache implementation below remains in use for DeepSeek. Earlier
+Qwen examples and measurements describe its former snapshot implementation;
+they are historical evidence, rather than qualification of the component path.
 
 ## Why it exists
 
@@ -354,7 +362,14 @@ A positive value replaces the automatic budget and may exceed it: it trades the
 free half of host RAM for retention, but always leaves 4 GiB to the OS and other
 processes. For an 8 GiB cap, use `--cache-ram-bytes 8589934592`. The startup
 line reports the selected `capacity_bytes`, the `automatic_bytes` budget and
-the `max_bytes` an explicit value may claim.
+the `max_bytes` an explicit value may claim. With a DFlash2 draft, each
+Qwen3.8-27B session also pins about 400 MiB of prompt capture at startup,
+reported as `slot_pinned_bytes`. It is charged on top of `capacity_bytes`: an
+explicit value may claim at most `max_bytes` minus `slot_pinned_bytes`, or the
+startup ceiling minus `slot_pinned_bytes` when that ceiling binds.
+`automatic_bytes` is half the available RAM measured before the pins. The
+`global_ram_bytes` gauge and the metadata category include the pins, so live
+usage can exceed `capacity_bytes`.
 
 Both are sampled after weights and execution states are allocated, then fixed
 for the server run. Flash-Next and Qwen3.8-27B use half the available
@@ -395,7 +410,8 @@ and retry copies are refused. This is a hardware ratio, not a cache policy:
 weights, execution states and the OS leave no more memory. To keep more deep
 conversations:
 
-- Raise `--cache-ram-bytes` towards the reported `max_bytes`: about 10.5 GB
+- Raise `--cache-ram-bytes` towards the reported `max_bytes` (less
+  `slot_pinned_bytes` on Qwen3.8-27B): about 10.5 GB
   here, enough for a 200k-token checkpoint plus a 50k one instead of only the
   first.
 - Run fewer `--sessions`: each Flash-Next session at 262144 context holds about
@@ -415,23 +431,26 @@ checkpoints at moderate depth without an explicit limit. See #259.
 RAM eviction follows the checkpoint priorities above. Disk eviction remains
 global least-recently-used, without conversation or rebuild-cost awareness.
 
-### Flash-Next budgets
+### Component-cache budgets
 
-Flash-Next keeps the same options with these meanings:
+Qwen27B and Flash-Next use the same options with these meanings:
 
 | Option | Meaning |
 | --- | --- |
 | `--cache-ram-bytes` | The automatic and explicit sizing above, as a cap. Pinned 64 KiB pages for up to about 89% of it are committed as captures need them, in equal steps of about 1 GiB, and stay committed; the rest is reserved for cache metadata, which grows with use. The pages hold checkpoint state, KV rows, partial tails and idle-session spill. There is no separate spill budget. |
 | `--cache-disk-bytes` | Counts referenced, temporary and orphaned files. A lower budget at startup removes temporaries and orphans, then the oldest checkpoints by creation order: use history does not survive a restart. |
 | `--cache-disk-staging-bytes` | Ignored, with an `event=option_ignored` warning. Disk transfers use an internal 1 MiB pinned buffer; checkpoints of any size stream through it. Its size did not change restore or write speed (#562), and a larger value only took pinned RAM and device heap. Earlier advice to raise staging no longer applies. |
-| `--cache-disk DIR` | Owned by one Flash-Next server. A second one fails at startup, before committing its RAM budget, with an ownership error naming the directory. Other models do not take this lock. Startup removes earlier-release `*.kvc` and `.tmp-*` files from the directory, including those of another model's server sharing it. |
+| `--cache-disk DIR` | Owned by one Qwen27B or Flash-Next server. A second one fails at startup, before committing its RAM budget, with an ownership error naming the directory. Other models do not take this lock. Startup removes earlier-release `*.kvc` and `.tmp-*` files from the directory, including those of another model's server sharing it. |
 
-The 128-record limit stays internal. Each checkpoint holds about 132 MB of
+The 128-record limit stays internal. The following measured sizes and timings
+are Flash-Next evidence; Qwen27B qualification is recorded in its model card.
+Each Flash-Next checkpoint holds about 132 MB of
 private state, so below a budget of about 19 GB that state caps the checkpoint
 count under 128; only larger explicit budgets can reach the record limit. The startup line
 `schema=component-cache-v1 event=configured` reports `capacity_bytes`,
-`automatic_bytes`, `max_bytes`, `staging_capacity_bytes` and
-`disk_capacity_bytes`.
+`automatic_bytes`, `max_bytes`, `staging_capacity_bytes`,
+`disk_capacity_bytes` and `slot_pinned_bytes` (host memory the sessions pinned
+at startup, charged on top of `capacity_bytes`).
 
 Flash-Next prepares a bounded two-segment reserve before readiness and can
 prepare the next segment before a prefill with at least 512 tokens remaining

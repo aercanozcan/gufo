@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -93,6 +94,9 @@ private:
 class FakeBackend final : public gufo::server::TextGenerationBackend {
 public:
   [[nodiscard]] std::string model_id() const override { return "test-model"; }
+  [[nodiscard]] std::vector<std::string> model_ids() const override {
+    return names;
+  }
   [[nodiscard]] bool ready() const override { return true; }
   [[nodiscard]] SamplingDefaults sampling_defaults() const override {
     return defaults;
@@ -213,6 +217,7 @@ public:
     condition.notify_all();
   }
 
+  std::vector<std::string> names{"test-model"};
   std::vector<std::string> pieces;
   std::vector<PromptProgress> progress;
   std::optional<gufo::sampling::JsonConstraint::ToolFormat> tool_format;
@@ -2226,6 +2231,39 @@ void TestWrongModelIsRejected() {
          "Rejected request never reaches the backend");
 }
 
+void TestServedModelNamesAreEchoed() {
+  FakeBackend backend;
+  backend.names = {"test-model", "additional"};
+  backend.pieces = {"ok"};
+  for (const std::string model : {"test-model", "additional"}) {
+    for (const bool stream : {false, true}) {
+      auto response = gufo::server::HandleOpenAiChat(
+          Request(
+              R"({"model":")" + model +
+              R"(","messages":[{"role":"user","content":"hello"}],"stream":)" +
+              (stream ? "true}" : "false}")),
+          backend);
+      Expect(response.status == 200, "Every served model name is accepted");
+      std::string body = response.body;
+      if (stream)
+        response.streaming_body([&](std::string_view chunk) {
+          body.append(chunk);
+          return true;
+        });
+      Expect(body.find(R"("model":")" + model + R"(")") != std::string::npos,
+             "The response names the model the request selected");
+    }
+  }
+  backend.names = {"test-model"};
+  const auto response = gufo::server::HandleOpenAiChat(
+      Request(
+          R"({"model":"additional","messages":[{"role":"user","content":"hi"}]})"),
+      backend);
+  Expect(response.status == 404 &&
+             response.body.find("model_not_found") != std::string::npos,
+         "A single served name accepts nothing else");
+}
+
 void TestClientIdentityReachesBackend() {
   FakeBackend backend;
   backend.pieces = {"ok"};
@@ -2292,10 +2330,22 @@ void TestImagePartsRetainOrderAndIdentity() {
   for (
       const auto* body :
       {R"({"messages":[{"role":"assistant","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AQID"}}]}]})",
-       R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AQID","detail":"low"}}]}]})",
+       R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AQID","detail":"ultra"}}]}]})",
+       R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AQID","detail":1}}]}]})",
        R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"file:///tmp/image.png"}}]}]})"}) {
     Expect(gufo::server::HandleOpenAiChat(Request(body), backend).status == 400,
            "unsupported image role, policy and URL are rejected");
+  }
+  // Codex sends "high" from view_image; every standard value behaves as auto.
+  for (const std::string detail : {"auto", "low", "high", "original"}) {
+    const auto accepted = gufo::server::HandleOpenAiChat(
+        Request(
+            R"({"model":"test-model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AQID","detail":")" +
+            detail + R"("}}]}]})"),
+        backend);
+    Expect(accepted.status == 200 &&
+               backend.last_request.messages.front().images.size() == 1,
+           "standard image detail values are accepted as auto");
   }
 }
 
@@ -2450,7 +2500,7 @@ void TestToolImagesRetainOrderAndIdentity() {
   }
   for (const auto* image :
        {R"({"url":17})",
-        R"({"url":"data:image/png;base64,AQID","detail":"high"})",
+        R"({"url":"data:image/png;base64,AQID","detail":"ultra"})",
         R"({"url":"file:///tmp/image.png"})",
         R"({"url":"data:image/png;base64,A==="})"}) {
     auto part = parse(R"({"type":"image_url"})");
@@ -6191,6 +6241,84 @@ void TestIncrementalToolArguments() {
       }
 }
 
+void TestParallelCallSeparatorIsNotContent() {
+  // Qwen writes a newline between parallel calls and may end with one. That
+  // layout is not a reply: the turn has null content, as with one call (#673).
+  const std::string alpha =
+      "<tool_call>\n<function=get_alpha>\n</function>\n</tool_call>";
+  const std::string beta =
+      "<tool_call>\n<function=get_beta>\n</function>\n</tool_call>";
+  for (const bool thinking : {false, true})
+    for (const bool stream : {false, true})
+      for (const bool constrained : {false, true})
+        for (const std::string separator : {"\n", "\n\n", " \n"}) {
+          auto body = gufo::json::parse(R"({
+            "model":"test-model","messages":[{"role":"user","content":"both"}],
+            "parallel_tool_calls":true,"tool_choice":"auto",
+            "tools":[{"type":"function","function":{"name":"get_alpha",
+              "parameters":{"type":"object","properties":{}}}},
+             {"type":"function","function":{"name":"get_beta",
+              "parameters":{"type":"object","properties":{}}}}]})");
+          body["stream"] = stream;
+          body["chat_template_kwargs"]["enable_thinking"] = thinking;
+          FakeBackend backend;
+          if (constrained)
+            backend.tool_format =
+                gufo::sampling::JsonConstraint::ToolFormat::kQwen;
+          const std::string raw = (thinking ? "Plan.</think>\n\n" : "") +
+                                  alpha + separator + beta + "\n";
+          for (char byte : raw)
+            backend.pieces.emplace_back(1, byte);
+          const auto response =
+              gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+          std::string content;
+          std::set<std::string> names;
+          bool null_content = false;
+          if (stream) {
+            response.streaming_body([&](std::string_view chunk) {
+              if (chunk == "data: [DONE]\n\n")
+                return true;
+              const auto event = gufo::json::parse(chunk.substr(6));
+              for (const auto& choice : event.find("choices")->items())
+                if (const auto* delta = choice.find("delta")) {
+                  content += delta->member_str("content");
+                  if (const auto* calls = delta->find("tool_calls"))
+                    for (const auto& call : calls->items())
+                      if (const auto* function = call.find("function"))
+                        if (!function->member_str("name").empty())
+                          names.insert(function->member_str("name"));
+                }
+              return true;
+            });
+          } else {
+            const auto parsed = gufo::json::parse(response.body);
+            const auto& message =
+                *parsed.find("choices")->items()[0].find("message");
+            null_content = message.find("content")->is_null();
+            for (const auto& call : message.find("tool_calls")->items())
+              names.insert(call.find("function")->member_str("name"));
+          }
+          Expect(names == std::set<std::string>{"get_alpha", "get_beta"},
+                 "both parallel calls are returned");
+          Expect(stream ? content.empty() : null_content,
+                 "whitespace between parallel calls is not content");
+        }
+  // Responses and Messages share the parser; neither reports a text item.
+  const std::string noop =
+      "<tool_call>\n<function=noop>\n</function>\n</tool_call>";
+  std::vector<std::string> pieces;
+  for (char byte : noop + "\n" + noop + "\n")
+    pieces.emplace_back(1, byte);
+  for (const int api : {1, 2})
+    for (const bool stream : {false, true}) {
+      const auto out = ToolBoundaryRequest(
+          pieces, gufo::sampling::JsonConstraint::ToolFormat::kQwen, api,
+          stream);
+      Expect(!out.failed && out.names.size() == 2 && out.content.empty(),
+             "Responses and Messages omit whitespace between parallel calls");
+    }
+}
+
 int main() {
   TestToolCallRenderParseRoundTrip();
   TestToolTagBoundaries();
@@ -6211,6 +6339,7 @@ int main() {
   TestStopInsideToolArguments();
   TestResponsesOutput();
   TestNativeToolTransports();
+  TestParallelCallSeparatorIsNotContent();
   TestJsonToolStringOwnership();
   TestNativeToolDialectSelection();
   TestNativeToolTextOutsideEnvelopes();
@@ -6259,6 +6388,7 @@ int main() {
   TestDeepSeekSchemaCheckedArguments();
   TestStreamingStopsAtRejectedParameter();
   TestWrongModelIsRejected();
+  TestServedModelNamesAreEchoed();
   TestClientIdentityReachesBackend();
   TestStreamingOverloadIsRejectedBeforeHeaders();
   TestImagePartsRetainOrderAndIdentity();

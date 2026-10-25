@@ -13,13 +13,14 @@
 
 #include "src/core/sampling.hpp"
 #include "src/core/session_mode.hpp"
+#include "src/core/speculative/prompt_lookup.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
-#include "src/models/qwen38_flash_next/prompt_lookup.hpp"
+#include "src/models/qwen38_flash_next/ngram.hpp"
 
 struct ihipStream_t;
 
@@ -31,7 +32,6 @@ namespace gufo::models::qwen38_flash_next {
 
 struct ModelWeights;
 struct MtpWeights;
-class NgramTable;
 struct MtpCandidateLogits;
 class ContinuationAdapter;
 class ContinuationHooks;
@@ -64,6 +64,11 @@ struct ModelOptions {
   /// Diagnostic observer for MoE inputs and outputs; see Executor::Options. The
   /// stream parameter is a `hipStream_t`, spelled without the HIP headers.
   std::function<void(const float*, std::size_t, ihipStream_t*)> moe_observer;
+  /// Static YaRN scaling, derived by the caller (serve, bench) from the
+  /// requested context via `RopeScalingForContext`. Empty leaves the
+  /// artifact's own setting, which is always off: no GGUF metadata key sets
+  /// it today.
+  std::optional<RopeScaling> rope_scaling{};
 };
 
 class Session;
@@ -191,11 +196,27 @@ public:
   /// RNG consumption includes proposal and verification draws. A
   /// one-token budget or a model without MTP uses ordinary decoding.
   /// Benchmarks may continue past EOS by setting stop_at_eos to false.
-  [[nodiscard]] bool DecodeStep(std::size_t max_tokens,
-                                sampling::SamplerState& sampler,
-                                DecodeResult* result,
-                                std::string* error_msg = nullptr,
-                                bool stop_at_eos = true);
+  /// A greedy step prices its drafts as one of `occupancy` decoding requests,
+  /// as DecodeBatch does for an unplanned cohort of that width.
+  /// `forced_drafts`, when given, fixes the cycle's draft count instead of
+  /// choosing it from this session's acceptance history (a TP2 rank 0's
+  /// choice, mirrored so both ranks run cycles of the same width).
+  [[nodiscard]] bool DecodeStep(
+      std::size_t max_tokens, sampling::SamplerState& sampler,
+      DecodeResult* result, std::string* error_msg = nullptr,
+      bool stop_at_eos = true, std::uint32_t occupancy = 1,
+      std::optional<std::uint32_t> forced_drafts = {});
+  /// The draft count DecodeStep would choose for this budget, priced as
+  /// PrepareDecode prices a `sampled` or greedy cycle among `occupancy`
+  /// decoding requests: from the session's acceptance history when the step
+  /// would speculate at all, else none (the step then uses its ordinary
+  /// width). A TP2 pair's rank 0 chooses it and the step runs with it on both
+  /// ranks. A sampled request that may draft through the small head is priced
+  /// on that head's curve, as PrepareDecode prices it, so the forced count
+  /// keeps the single-host width in the common case.
+  [[nodiscard]] std::optional<std::uint32_t> PlanDecode(
+      std::size_t max_tokens, const sampling::SamplerState& sampler,
+      std::uint32_t occupancy = 1) const;
   struct BatchOutcome {
     bool completed{false};
     std::string error{};
@@ -207,6 +228,9 @@ public:
     DecodeResult* result;
     bool stop_at_eos{true};
     BatchOutcome* outcome{nullptr};
+    /// This request's forced draft count (a TP2 peer's choice), overriding
+    /// the batch's shared plan.
+    std::optional<std::uint32_t> drafts{};
   };
   /// A false return may include completed peers. Inspect each outcome; only
   /// sessions whose persistent state was partly mutated become invalid.
@@ -259,6 +283,9 @@ public:
   [[nodiscard]] const SpeculativeStats& Statistics() const noexcept {
     return stats_;
   }
+  /// PLE rows gathered by this execution slot since creation; zero without
+  /// a PLE table.
+  [[nodiscard]] NgramTotals NgramRowTotals() const noexcept;
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
   static constexpr std::uint32_t kSnapshotPayloadVersion = 18;
@@ -322,7 +349,8 @@ private:
   bool DraftReplay(std::int32_t next_token, std::vector<std::int32_t>* replay,
                    std::int32_t* hidden_row, std::string* error_msg) const;
   static bool DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
-                                std::string* error_msg);
+                                std::string* error_msg,
+                                std::span<const std::uint8_t> propose = {});
   template<class Request>
   static bool RunIsolatedBatch(
       std::span<const Request> requests, std::string* error_msg,
@@ -333,13 +361,16 @@ private:
   static bool EvaluateBatchImpl(std::span<const AdvanceRequest> requests,
                                 std::string* error_msg);
   struct PendingDecode;
+  /// `batch_drafts` forces the cycle's draft count for a batched step; a
+  /// request's own `drafts` overrides it.
   bool PrepareDecode(const DecodeRequest& request, PendingDecode* pending,
                      std::string* error_msg, bool defer_head = false,
-                     std::optional<std::uint32_t> batch_drafts = {});
+                     std::optional<std::uint32_t> batch_drafts = {},
+                     std::uint32_t occupancy = 1);
   static void AppendDraft(PendingDecode& pending);
   /// Appends copies within the prepared budget, stopping at EOG when enabled.
   bool AppendLookup(PendingDecode& pending, bool stop_at_eos,
-                    std::size_t minimum = 1);
+                    std::size_t minimum = 1, bool require_resume = false);
   bool FinishDecode(const DecodeRequest& request, const PendingDecode& pending,
                     std::string* error_msg);
 
@@ -352,7 +383,7 @@ private:
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
   MtpLengthController draft_length_;
   /// Index of tokens_ for prompt lookup (single-session MTP drafts).
-  PromptLookup lookup_;
+  speculative::PromptLookup<> lookup_;
   SpeculativeStats stats_;
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(

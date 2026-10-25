@@ -1,6 +1,7 @@
 #ifndef GUFO_SERVER_TEXT_GENERATION_BACKEND_HPP_
 #define GUFO_SERVER_TEXT_GENERATION_BACKEND_HPP_
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -214,6 +215,12 @@ public:
     std::size_t draft_accepted_tokens{0};
     std::size_t lookup_tokens{0};
     std::size_t lookup_accepted_tokens{0};
+    /// Hashed n-gram embedding rows gathered for this request, split by how
+    /// each was served.
+    std::size_t ngram_rows{0};
+    std::size_t ngram_dedup_rows{0};
+    std::size_t ngram_cache_hits{0};
+    std::size_t ngram_disk_reads{0};
     std::size_t prefill_tokens{0};
     std::size_t prefill_chunks{0};
     std::size_t active_decode_prefill_chunks{0};
@@ -289,6 +296,14 @@ public:
   TextGenerationBackend& operator=(TextGenerationBackend&&) = delete;
 
   [[nodiscard]] virtual std::string model_id() const = 0;
+  /// Every name requests may select this model by, model_id() first.
+  [[nodiscard]] virtual std::vector<std::string> model_ids() const {
+    return {model_id()};
+  }
+  [[nodiscard]] bool serves_model(std::string_view name) const {
+    const auto names = model_ids();
+    return std::ranges::find(names, name) != names.end();
+  }
   [[nodiscard]] virtual bool ready() const = 0;
   /// True once a failed generation showed that the execution device can no
   /// longer run work, for example after a GPU reset. The loss is permanent.
@@ -302,6 +317,10 @@ public:
   }
   /// Whether the loaded backend accepts image inputs in chat requests.
   [[nodiscard]] virtual bool supports_images() const { return false; }
+  /// The served model file and build revision, as llama-server's /props
+  /// reports them. Empty when unknown.
+  [[nodiscard]] virtual std::string model_path() const { return {}; }
+  [[nodiscard]] virtual std::string build_info() const { return {}; }
   [[nodiscard]] virtual SamplingDefaults sampling_defaults() const {
     return {};
   }

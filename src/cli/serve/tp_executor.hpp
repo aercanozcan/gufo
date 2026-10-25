@@ -107,6 +107,7 @@ struct TpRequestContext final : TextPromptContext {
       : sequence(sequence), images(std::move(images)) {
     if (this->images != nullptr) {
       cache_identity = this->images->cache_identity;
+      cache_prefixes = this->images->cache_prefixes;
     }
   }
   std::uint64_t sequence;
@@ -172,13 +173,21 @@ public:
   BuildConstraintVocabulary() const override;
   [[nodiscard]] sampling::JsonConstraint::ToolFormat ToolFormat()
       const override;
+  /// Rank 1 builds a request's reasoning budget with its own runner, so rank
+  /// 0 must build it from the same tags, control tokens and vocabulary.
+  [[nodiscard]] ReasoningTags ReasoningBudgetTags() const override;
+  [[nodiscard]] std::uint32_t VocabularySize() const override;
   [[nodiscard]] DeviceProbeStatus PollDevice() const override;
   [[nodiscard]] bool DeviceUsable() const override;
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
       std::string_view text) const override;
+  [[nodiscard]] std::vector<TextRunnerToken> TokenizeControl(
+      std::string_view text) const override;
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override;
   [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
+      const ChatRequest& request) const override;
+  [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
       const ChatRequest& request) const override;
   void SetPromptContext(
       TextRunnerState& state,
@@ -197,6 +206,8 @@ public:
   void PreparePrefixReuse(
       TextRunnerState& state,
       std::span<const TextRunnerToken> prefix) const override;
+  [[nodiscard]] TextRunnerNgramRows NgramRows(
+      const TextRunnerState& state) const override;
   void PrepareBatchExecution(TextRunnerState& state) const override;
   [[nodiscard]] TextPrefillStep Prefill(
       TextRunnerState& state, std::span<const TextRunnerToken> prompt,

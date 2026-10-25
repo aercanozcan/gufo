@@ -12,8 +12,10 @@
 #include <string>
 #include <vector>
 
+#include "src/models/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
+#include "src/models/qwen38_flash_next/rope_scaling.hpp"
 
 namespace q = gufo::models::qwen38_flash_next::rocm;
 namespace {
@@ -201,7 +203,7 @@ void CheckSsmProjection(const void* w, const __half* x, float* projected,
   }
   // A rejected geometry must not touch any pointer.
   if (q::DenseF16SsmGemm(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                         1023, m, k, channels, 4, nullptr) ||
+                         0, m, k, channels, 4, nullptr) ||
       q::DenseF16SsmGemm(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                          batch, m, k, channels, 3, nullptr)) {
     throw std::runtime_error("SSM projection accepted an unsupported shape");
@@ -211,9 +213,10 @@ void CheckSsmProjection(const void* w, const __half* x, float* projected,
 
 /// `heads` query heads over `kv_heads` KV heads: the model's 24 over two, or
 /// a TP rank's 12 over one.
-void CheckAttentionProjection(const void* weights, const __half* input,
-                              const float* projected, std::uint32_t batch,
-                              std::uint32_t heads, std::uint32_t kv_heads) {
+void CheckAttentionProjection(
+    const void* weights, const __half* input, const float* projected,
+    std::uint32_t batch, std::uint32_t heads, std::uint32_t kv_heads,
+    const gufo::models::qwen38_flash_next::YarnRope& yarn = {}) {
   constexpr std::uint32_t start = 131069;
   const std::uint32_t rows = 2 * (heads + kv_heads) * 256;
   const std::size_t query_bytes = (std::size_t(batch) * heads * 256 + 16) * 4;
@@ -256,12 +259,19 @@ void CheckAttentionProjection(const void* weights, const __half* input,
                            static_cast<float*>(expected[1]) + 8,
                            static_cast<__half*>(expected[2]) + 8,
                            static_cast<__half*>(expected[3]) + 8, batch, heads,
-                           kv_heads, 256, 64, position, 1e7F, 1e-6F, nullptr))
+                           kv_heads, 256, 64, position, 1e7F, 1e-6F, nullptr,
+                           nullptr, false, yarn))
     throw std::runtime_error("attention preparation rejected the model shape");
   hipStream_t stream = nullptr;
   hipGraph_t graph = nullptr;
   hipGraphExec_t replay = nullptr;
   CheckHip(hipStreamCreate(&stream), "attention stream");
+  gufo::models::qwen::vision::DeviceInput vision;
+  vision.PrepareRope(stream);
+  const auto* descriptor = vision.rope();
+  vision.PrepareRope(stream);
+  if (descriptor == nullptr || vision.rope() != descriptor)
+    throw std::runtime_error("prepared image descriptor is not stable");
   CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
            "attention capture");
   if (!q::AttentionF16Gemm(weights, input, device_gamma, device_gamma + 256,
@@ -269,12 +279,16 @@ void CheckAttentionProjection(const void* weights, const __half* input,
                            static_cast<float*>(actual[1]) + 8,
                            static_cast<__half*>(actual[2]) + 8,
                            static_cast<__half*>(actual[3]) + 8, batch, heads,
-                           kv_heads, position, 1e7F, 1e-6F, stream))
+                           kv_heads, position, 1e7F, 1e-6F, stream,
+                           vision.rope(), yarn))
     throw std::runtime_error("attention fusion rejected the model shape");
   CheckHip(hipStreamEndCapture(stream, &graph), "attention capture end");
   CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
            "attention graph");
   for (unsigned repetition = 0; repetition < 2; ++repetition) {
+    vision.RestoreLayout({}, stream);
+    if (vision.rope() != descriptor)
+      throw std::runtime_error("text restore replaced the image descriptor");
     for (unsigned i = 0; i < 4; ++i)
       CheckHip(hipMemsetAsync(actual[i], 0xA5,
                               i < 2 ? query_bytes : cache_bytes, stream),
@@ -297,12 +311,15 @@ void CheckAttentionProjection(const void* weights, const __half* input,
                           static_cast<float*>(actual[0]) + 8,
                           static_cast<float*>(actual[1]) + 8,
                           static_cast<__half*>(actual[2]) + 8,
-                          static_cast<__half*>(actual[3]) + 8, 1023, heads,
-                          kv_heads, position, 1e7F, 1e-6F, nullptr))
-    throw std::runtime_error("attention fusion accepted a short batch");
+                          static_cast<__half*>(actual[3]) + 8, 0, heads,
+                          kv_heads, position, 1e7F, 1e-6F, nullptr, nullptr,
+                          yarn))
+    throw std::runtime_error("attention fusion accepted an empty batch");
   CheckHip(hipGraphExecDestroy(replay), "attention graph free");
   CheckHip(hipGraphDestroy(graph), "attention graph definition free");
   CheckHip(hipStreamDestroy(stream), "attention stream free");
+  std::cout << "fused attention projection yarn=" << yarn.enabled
+            << ": exact against PrepareAttention, including replay\n";
 }
 
 void CheckHcDownProjection(const void* w, const void* tiled,
@@ -519,6 +536,65 @@ void CheckRoutedQ8Placement() {
     CheckHip(hipFree(p), "routed Q8 free");
 }
 
+// Two streams quantize their activations into qfn_mmq scratch at the same
+// time. Each stream owns its scratch arena, so neither can overwrite the
+// other's activations while a launch is in flight.
+void CheckDenseAcrossStreams() {
+  constexpr std::size_t batch = 200, m = 2560, k = 6144;
+  const Q8Weights w = MakeWeights(m, k, 0x5713EA11U);
+  std::vector<float> x(2 * batch * k);
+  std::uint32_t state = 0x5713EA12U;
+  for (float& v : x)
+    v = Uniform(&state, 2.0F);
+  void* d_w = nullptr;
+  float* d_x = nullptr;
+  float* d_y = nullptr;
+  CheckHip(hipMalloc(&d_w, w.blocks.size() + 4096), "hipMalloc");
+  CheckHip(hipMalloc(&d_x, x.size() * 4), "hipMalloc");
+  CheckHip(hipMalloc(&d_y, 2 * batch * m * 4), "hipMalloc");
+  CheckHip(
+      hipMemcpy(d_w, w.blocks.data(), w.blocks.size(), hipMemcpyHostToDevice),
+      "upload");
+  CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
+           "upload");
+  const auto dense = [&](int input, hipStream_t stream) {
+    if (qfn_mmq_q8_0_dense(d_w, d_x + input * batch * k,
+                           d_y + input * batch * m, static_cast<int>(m),
+                           static_cast<int>(batch), static_cast<int>(k),
+                           stream) != 0)
+      throw std::runtime_error("MMQ dense failed");
+  };
+  dense(0, nullptr);
+  dense(1, nullptr);
+  CheckHip(hipDeviceSynchronize(), "serial dense");
+  std::vector<float> expected(2 * batch * m);
+  CheckHip(hipMemcpy(expected.data(), d_y, expected.size() * 4,
+                     hipMemcpyDeviceToHost),
+           "download");
+  hipStream_t streams[2] = {};
+  for (auto& stream : streams)
+    CheckHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
+  std::vector<float> actual(expected.size());
+  for (int round = 0; round < 20; ++round) {
+    CheckHip(hipMemset(d_y, 0xff, actual.size() * 4), "clear");
+    CheckHip(hipDeviceSynchronize(), "clear");
+    dense(0, streams[0]);
+    dense(1, streams[1]);
+    CheckHip(hipDeviceSynchronize(), "concurrent dense");
+    CheckHip(
+        hipMemcpy(actual.data(), d_y, actual.size() * 4, hipMemcpyDeviceToHost),
+        "download");
+    if (actual != expected)
+      throw std::runtime_error("MMQ dense output depends on another stream");
+  }
+  for (auto stream : streams) {
+    qfn_mmq_release_stream(stream);
+    CheckHip(hipStreamDestroy(stream), "stream destroy");
+  }
+  for (void* p : {d_w, static_cast<void*>(d_x), static_cast<void*>(d_y)})
+    CheckHip(hipFree(p), "free");
+}
+
 double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
            std::size_t reference_tokens = 0) {
   const Q8Weights w = MakeWeights(m, k, seed);
@@ -653,7 +729,7 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
             << worst_f16_vs_mmq << ", worst |W8A8 - F64| " << worst_vs_ref
             << ", worst |F16 - F64| " << worst_f16 << " (reference scale "
             << ref_scale << ")\n";
-  if ((m == 16384 || m == 8192) && k == 2560 && batch >= 1024) {
+  if ((m == 16384 || m == 8192) && k == 2560 && batch > 8) {
     CheckSsmProjection(d_w, d_x_half, d_f16, f16,
                        static_cast<std::uint32_t>(batch), m == 16384 ? 16 : 8,
                        m == 16384 ? 48 : 24);
@@ -662,10 +738,15 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
     CheckHcDownProjection(d_w, d_tiled, d_w8,
                           static_cast<std::uint32_t>(batch));
   }
-  if ((m == 13312 || m == 6656) && k == 2560 && batch >= 1024) {
+  if ((m == 13312 || m == 6656) && k == 2560 && batch > 8) {
     CheckAttentionProjection(d_w, d_x_half, d_f16,
                              static_cast<std::uint32_t>(batch),
                              m == 13312 ? 24 : 12, m == 13312 ? 2 : 1);
+    CheckAttentionProjection(
+        d_w, d_x_half, d_f16, static_cast<std::uint32_t>(batch),
+        m == 13312 ? 24 : 12, m == 13312 ? 2 : 1,
+        gufo::models::qwen38_flash_next::MakeYarnRope(
+            {.factor = 2.5F, .original_context = 262144}, 64, 1e7F));
   }
   (void)hipFree(d_w);
   (void)hipFree(d_x);
@@ -943,9 +1024,14 @@ int main() {
     if (qfn_mmq_init(0) != 0)
       throw std::runtime_error("prepare quantized decode projections");
     CheckRoutedQ8Placement();
+    CheckDenseAcrossStreams();
     CheckSmallProjection(q::WeightType::kF32, 513, 2560);
     CheckSmallProjection(q::WeightType::kF32, 96, 2560);
     CheckSmallProjection(q::WeightType::kBF16, 129, 2560);
+    CheckSmallProjection(q::WeightType::kF16, 513, 2560);
+    CheckSmallProjection(q::WeightType::kF16, 96, 2560);
+    CheckSmallProjection(q::WeightType::kBF16, 128, 2560);
+    CheckSmallProjection(q::WeightType::kBF16, 512, 2560);
     CheckSmallProjection(q::WeightType::kF16, 7, 131);
     CheckDecodeGrouping(64, 2560);
     CheckDecodeGrouping(320, 10240);
@@ -975,6 +1061,16 @@ int main() {
     ok = Run(2049, 13312, 2560, 0x13312256U, 2) < 1e-2 && ok;
     // A TP rank's attention heads: 12 query heads over one KV head.
     ok = Run(2049, 6656, 2560, 0x6656256U, 2) < 1e-2 && ok;
+    // Every prefill pass wider than a vector batch fuses these projections:
+    // one partial 32-token tile, a ragged 128-token tile and a mid-size pass,
+    // for the model's heads and a TP rank's.
+    for (const std::size_t batch : {9U, 33U, 470U}) {
+      const auto seed = static_cast<std::uint32_t>(batch);
+      ok = Run(batch, 16384, 2560, 0x16384000U + seed, 2) < 1e-2 && ok;
+      ok = Run(batch, 13312, 2560, 0x13312000U + seed, 2) < 1e-2 && ok;
+      ok = Run(batch, 8192, 2560, 0x08192000U + seed, 2) < 1e-2 && ok;
+      ok = Run(batch, 6656, 2560, 0x06656000U + seed, 2) < 1e-2 && ok;
+    }
     // HC up: the grouped grid, including the last partial token tile.
     ok = Run(2049, 10240, 320, 0x8A8A320U, 2) < 1e-2 && ok;
     // HC down fusion: its first supported batch and a partial final tile.

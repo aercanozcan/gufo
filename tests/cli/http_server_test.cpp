@@ -26,10 +26,13 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/trace.hpp"
+#include "src/core/platform/net.hpp"
 
 namespace {
+namespace net = gufo::net;
 
 using gufo::server::HttpServer;
 using gufo::server::Logger;
@@ -91,6 +94,8 @@ public:
     output_ = std::move(text);
   }
   std::string model_id() const override { return "test"; }
+  std::vector<std::string> model_ids() const override { return names; }
+  std::vector<std::string> names{"test"};
   bool ready() const override { return true; }
   bool device_lost() const override { return lost.load(); }
   bool supports_images() const override { return image_support.load(); }
@@ -98,6 +103,10 @@ public:
   std::uint32_t max_context() const override { return 65536; }
   std::vector<SessionState> session_states() const override { return sessions; }
   std::vector<SessionState> sessions;
+  std::string model_path() const override { return served_path; }
+  std::string build_info() const override { return served_build; }
+  std::string served_path;
+  std::string served_build;
   std::shared_ptr<GenerationRequest> start_complete(
       std::string_view prompt, std::size_t max_tokens,
       const gufo::sampling::SamplingConfig& sampling,
@@ -342,9 +351,7 @@ public:
     }
     const int fd = ::socket(address.ss_family, SOCK_STREAM, 0);
     assert(fd >= 0);
-    const timeval timeout{3, 0};
-    assert(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                        sizeof(timeout)) == 0);
+    assert(net::SetSocketTimeouts(fd, 3'000));
     assert(::connect(fd, reinterpret_cast<const sockaddr*>(&address), length) ==
            0);
     return fd;
@@ -353,8 +360,7 @@ public:
                    const std::string& peer = "127.0.0.1") {
     const int fd = Connect(peer);
     while (!request.empty()) {
-      const auto count =
-          ::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
+      const auto count = net::SendNoSignal(fd, request.data(), request.size());
       assert(count > 0);
       request.remove_prefix(static_cast<std::size_t>(count));
     }
@@ -372,7 +378,7 @@ public:
       }
       response.append(buffer, static_cast<std::size_t>(count));
     }
-    ::close(fd);
+    net::CloseSocket(fd);
     return response;
   }
 
@@ -763,6 +769,46 @@ void TestFramingAndMetrics() {
   assert(timings->member_double("prompt_per_token_ms") == 2);
 }
 
+// curl sends "Expect: 100-continue" before a body over 1 MiB and waits for
+// the interim response; without it, every large upload stalls for a second.
+void TestExpectContinue() {
+  RunningServer server({.max_request_body_bytes = 8192});
+  for (const std::string expect :
+       {"Expect: 100-continue", "expect: 100-Continue"}) {
+    const int fd = server.Connect();
+    const std::string head =
+        "POST /echo HTTP/1.1\r\n" + expect + "\r\nContent-Length: 5\r\n\r\n";
+    assert(net::SendNoSignal(fd, head.data(), head.size()) ==
+           static_cast<ssize_t>(head.size()));
+    // The interim response arrives before any body byte is sent.
+    const std::string_view interim = "HTTP/1.1 100 Continue\r\n\r\n";
+    std::string response;
+    char buffer[4096];
+    while (response.size() < interim.size()) {
+      const auto count = ::read(fd, buffer, interim.size() - response.size());
+      assert(count > 0);
+      response.append(buffer, static_cast<std::size_t>(count));
+    }
+    assert(response == interim);
+    assert(net::SendNoSignal(fd, "hello", 5) == 5);
+    response.clear();
+    for (;;) {
+      const auto count = ::read(fd, buffer, sizeof(buffer));
+      assert(count >= 0);
+      if (count == 0)
+        break;
+      response.append(buffer, static_cast<std::size_t>(count));
+    }
+    net::CloseSocket(fd);
+    ExpectStatus(response, 200);
+    assert(response.substr(response.find("\r\n\r\n") + 4) == "hello");
+  }
+  // An oversized body gets its final status instead of the interim one.
+  ExpectStatus(server.Send("POST /echo HTTP/1.1\r\nExpect: 100-continue\r\n"
+                           "Content-Length: 8193\r\n\r\n"),
+               413);
+}
+
 void TestFallbackBackendMetrics() {
   namespace metrics = gufo::server::detail;
   RunningServer server;
@@ -842,6 +888,52 @@ void TestFallbackBackendMetrics() {
            prompt_before + test.expected_prompt);
     assert(metrics::TotalGenTokens().load() == generated_before + 2);
   }
+}
+
+// /props reports what the server runs, as llama-server's does, so a client
+// can record which model, build and settings answered it.
+void TestLlamaProps() {
+  RunningServer server;
+  const auto props = [&](const std::string& path) {
+    const auto response = server.Send("GET " + path + " HTTP/1.1\r\n\r\n");
+    ExpectStatus(response, 200);
+    return gufo::json::parse(response.substr(response.find("\r\n\r\n") + 4));
+  };
+
+  // Nothing is invented for what the backend does not report.
+  const auto bare = props("/props");
+  assert(bare.member_str("model") == "test");
+  assert(bare.member_str("model_alias") == "test");
+  assert(!bare.contains("model_path"));
+  assert(!bare.contains("build_info"));
+  assert(!bare.contains("total_slots"));
+  const auto* generation = bare.find("default_generation_settings");
+  assert(generation != nullptr && generation->member_size("n_ctx") == 65536);
+  const auto* params = generation->find("params");
+  assert(params->contains("temperature"));
+  assert(params->find("n_predict")->as_double() == -1.0);
+  assert(params->find("max_tokens")->as_double() == -1.0);
+  assert(!bare.find("modalities")->find("vision")->as_bool(true));
+
+  server.backend->served_path = "/models/model-00001-of-00002.gguf";
+  server.backend->served_build = "0.2.0 (abc1234)";
+  server.backend->sessions.resize(2);
+  server.backend->image_support = true;
+  server.backend->defaults.max_tokens = 512;
+  const auto full = props("/props");
+  assert(full.member_str("model_path") == "/models/model-00001-of-00002.gguf");
+  assert(full.member_str("build_info") == "0.2.0 (abc1234)");
+  assert(full.member_size("total_slots") == 2);
+  assert(full.find("default_generation_settings")
+             ->find("params")
+             ->member_size("n_predict") == 512);
+  assert(full.find("modalities")->find("vision")->as_bool());
+
+  // ?model= is accepted and not required, as outside llama-server router mode.
+  const auto named = props("/props?model=alias");
+  assert(named.member_str("model") == "alias");
+  assert(named.member_str("model_alias") == "test");
+  assert(named.member_str("build_info") == "0.2.0 (abc1234)");
 }
 
 void TestLlamaSlotsAndMetrics() {
@@ -1237,7 +1329,18 @@ void TestCompatibilityRequests() {
     assert(error.member_str("code") == "invalid_request");
     assert(error.member_str("message").find(expected) != std::string::npos);
   }
+  ExpectStatus(server.Post("/v1/responses",
+                           R"({"input":[{"role":"user","content":[
+        {"type":"input_image","image_url":"data:image/png;base64,AA==","detail":"ultra"}]}]})"),
+               400);
   assert(server.backend->calls == calls);
+
+  // Codex's view_image sends detail "high"; it is served as automatic detail.
+  response_body(server.Post("/v1/responses",
+                            R"({"input":[{"role":"user","content":[
+        {"type":"input_text","text":"describe"},
+        {"type":"input_image","image_url":"data:image/png;base64,AA==","detail":"high"}]}]})"));
+  assert(server.backend->LastCall().chat.messages.back().images.size() == 1);
 
   const auto structured =
       response_body(server.Post("/v1/responses",
@@ -2012,6 +2115,80 @@ void TestModelInputModalities() {
   }
 }
 
+void TestServedModelNames() {
+  RunningServer server;
+  using gufo::json::parse;
+  const auto body_of = [](const std::string& response) {
+    return parse(response.substr(response.find("\r\n\r\n") + 4));
+  };
+  const auto listed = [&] {
+    std::vector<std::string> ids;
+    const auto models = server.Send("GET /v1/models HTTP/1.1\r\n\r\n");
+    ExpectStatus(models, 200);
+    const auto listing = body_of(models);
+    for (const auto& model : listing.find("data")->items()) {
+      assert(model.member_size("context_length") == 65536);
+      ids.push_back(model.member_str("id"));
+    }
+    return ids;
+  };
+  struct Endpoint {
+    const char *path, *fields;
+    bool echoes = true;
+  };
+  const Endpoint endpoints[] = {
+      {"/v1/chat/completions",
+       R"("messages":[{"role":"user","content":"hi"}])"},
+      {"/v1/completions", R"("prompt":"hi")"},
+      {"/v1/responses", R"("input":"hi")"},
+      {"/v1/messages", R"("messages":[{"role":"user","content":"hi"}])"},
+      {"/v1/messages/count_tokens",
+       R"("messages":[{"role":"user","content":"hi"}])", false},
+      {"/completion", R"("prompt":"hi")", false},
+  };
+  server.backend->chat_token_count = 1;
+  const auto post = [&](const Endpoint& endpoint, const std::string& model) {
+    return server.Post(endpoint.path, R"({"model":")" + model + R"(",)" +
+                                          endpoint.fields + "}");
+  };
+  // One name serves as before: it alone is listed and accepted.
+  assert(listed() == std::vector<std::string>{"test"});
+  for (const auto& endpoint : endpoints) {
+    const auto response = post(endpoint, "test");
+    ExpectStatus(response, 200);
+    assert(!endpoint.echoes || body_of(response).member_str("model") == "test");
+    const auto unknown = post(endpoint, "additional");
+    ExpectStatus(unknown, 404);
+    assert(unknown.find("model_not_found") != std::string::npos);
+  }
+
+  server.backend->names = {"test", "additional", "books"};
+  assert(listed() == server.backend->names);
+  for (const auto& endpoint : endpoints) {
+    for (const auto& model : server.backend->names) {
+      const auto response = post(endpoint, model);
+      ExpectStatus(response, 200);
+      assert(!endpoint.echoes ||
+             body_of(response).member_str("model") == model);
+    }
+    const auto unknown = post(endpoint, "other");
+    ExpectStatus(unknown, 404);
+    assert(unknown.find("model_not_found") != std::string::npos);
+  }
+  // Streamed events carry the additional name the request selected.
+  const auto streamed = server.Post(
+      "/v1/responses", R"({"model":"books","input":"hi","stream":true})");
+  ExpectStatus(streamed, 200);
+  assert(streamed.find("text/event-stream") != std::string::npos &&
+         streamed.find(R"("model":"books")") != std::string::npos &&
+         streamed.find(R"("model":"test")") == std::string::npos);
+  // Without a model field the primary name answers.
+  assert(body_of(server.Post("/v1/responses", R"({"input":"hi"})"))
+             .member_str("model") == "test");
+  server.backend->names = {"test"};
+  server.backend->chat_token_count.reset();
+}
+
 void TestRawCompletionStreaming() {
   RunningServer server;
   using gufo::json::parse;
@@ -2270,7 +2447,7 @@ void TestDeviceLossWhileWriterBlocked() {
   assert(::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer,
                       sizeof(receive_buffer)) == 0);
   const std::string request = "POST /blocked HTTP/1.1\r\n\r\n";
-  assert(::send(fd, request.data(), request.size(), MSG_NOSIGNAL) ==
+  assert(net::SendNoSignal(fd, request.data(), request.size()) ==
          static_cast<ssize_t>(request.size()));
   assert(writing.try_acquire_for(std::chrono::seconds(2)));
   // The peer never drains the response. No health request or completed write
@@ -2279,7 +2456,7 @@ void TestDeviceLossWhileWriterBlocked() {
   assert(hook_called.try_acquire_for(std::chrono::seconds(2)));
   assert(hook_calls == 1 && !write_finished);
   ::shutdown(fd, SHUT_RDWR);
-  ::close(fd);
+  net::CloseSocket(fd);
 }
 
 void TestInvalidBindSettings() {
@@ -2305,7 +2482,7 @@ bool HasIpv6Loopback() {
   address.sin6_addr = in6addr_loopback;
   const bool bound = ::bind(fd, reinterpret_cast<const sockaddr*>(&address),
                             sizeof(address)) == 0;
-  ::close(fd);
+  net::CloseSocket(fd);
   return bound;
 }
 
@@ -2354,7 +2531,7 @@ int FreePort(const std::string& host = "127.0.0.1") {
   assert(::bind(fd, reinterpret_cast<const sockaddr*>(&address), length) == 0);
   assert(::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) ==
          0);
-  ::close(fd);
+  net::CloseSocket(fd);
   return ntohs(address.ss_family == AF_INET6 ? ipv6->sin6_port
                                              : ipv4->sin_port);
 }
@@ -2376,11 +2553,9 @@ int ConnectTo(const std::string& host, int port) {
   }
   const int fd = ::socket(address.ss_family, SOCK_STREAM, 0);
   assert(fd >= 0);
-  const timeval timeout{3, 0};
-  assert(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ==
-         0);
+  assert(net::SetSocketTimeouts(fd, 3'000));
   if (::connect(fd, reinterpret_cast<const sockaddr*>(&address), length) != 0) {
-    ::close(fd);
+    net::CloseSocket(fd);
     return -1;
   }
   return fd;
@@ -2394,7 +2569,7 @@ std::string SendParts(const std::string& host, int port,
   for (std::size_t index = 0; index < parts.size(); ++index) {
     if (index > 0)
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    assert(::send(fd, parts[index].data(), parts[index].size(), MSG_NOSIGNAL) ==
+    assert(net::SendNoSignal(fd, parts[index].data(), parts[index].size()) ==
            static_cast<ssize_t>(parts[index].size()));
   }
   std::string response;
@@ -2406,7 +2581,7 @@ std::string SendParts(const std::string& host, int port,
       break;
     response.append(buffer, static_cast<std::size_t>(count));
   }
-  ::close(fd);
+  net::CloseSocket(fd);
   return response;
 }
 
@@ -2463,8 +2638,8 @@ void TestLoadingResponder() {
   loading.stop();
   assert(std::chrono::steady_clock::now() - started < std::chrono::seconds(2));
   assert(!loading.listening());
-  ::close(idle);
-  ::close(idle_during_stop);
+  net::CloseSocket(idle);
+  net::CloseSocket(idle_during_stop);
 
   // Handoff: the real server binds the same address and answers health.
   HttpServer server("127.0.0.1", port, nullptr);
@@ -2549,10 +2724,10 @@ void TestPeerDisconnect() {
       "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\n"
       "Content-Type: application/json\r\nContent-Length: " +
       std::to_string(body.size()) + "\r\n\r\n" + body;
-  assert(::send(fd, request.data(), request.size(), MSG_NOSIGNAL) ==
+  assert(net::SendNoSignal(fd, request.data(), request.size()) ==
          static_cast<ssize_t>(request.size()));
   assert(server.backend->entered.try_acquire_for(std::chrono::seconds(2)));
-  ::close(fd);
+  net::CloseSocket(fd);
   assert(server.backend->finished.try_acquire_for(std::chrono::seconds(2)));
   assert(server.backend->disconnected);
 }
@@ -2900,7 +3075,7 @@ void TestSignalShutdown() {
             const std::string request =
                 "POST /v1/completions HTTP/1.1\r\nContent-Length: " +
                 std::to_string(body.size()) + "\r\n\r\n" + body;
-            assert(::send(fd, request.data(), request.size(), MSG_NOSIGNAL) ==
+            assert(net::SendNoSignal(fd, request.data(), request.size()) ==
                    static_cast<ssize_t>(request.size()));
             assert(server.backend->entered.try_acquire_for(
                 std::chrono::seconds(2)));
@@ -2909,7 +3084,7 @@ void TestSignalShutdown() {
           assert(server.run_finished.try_acquire_for(std::chrono::seconds(2)));
           if (active) {
             assert(server.backend->disconnected);
-            ::close(fd);
+            net::CloseSocket(fd);
           }
         }
         ::_exit(0);
@@ -2987,6 +3162,182 @@ void TestRawCompletionPromptProgress() {
                400);
 }
 
+// A server with only an embedding service and no text backend answers
+// /v1/embeddings behind the API key, lists the model, and reports readiness.
+std::shared_ptr<gufo::server::EmbeddingService> MakeEmbeddingService(
+    bool ready) {
+  using gufo::server::EmbeddingBatch;
+  using gufo::server::EmbeddingServiceOptions;
+  using gufo::server::EmbeddingStatus;
+  return std::make_shared<gufo::server::EmbeddingService>(
+      EmbeddingServiceOptions{
+          .model_root = "/nonexistent/embeddinggemma",
+          .validate_model = !ready,  // Validation fails without a checkpoint.
+          .model_id = "embedding-test",
+          .runner =
+              [](const std::vector<gufo::server::EmbeddingInput>& texts,
+                 EmbeddingBatch* batch, std::string*) {
+                for (const auto& text : texts) {
+                  batch->embeddings.push_back({1.0F, 0.0F});
+                  std::size_t count = 2;
+                  for (const auto& part : text.content)
+                    count += part.value.size();
+                  batch->token_counts.push_back(count);
+                }
+                return EmbeddingStatus::kOk;
+              },
+      });
+}
+
+std::string EmbeddingPost(int port, std::string_view body,
+                          std::string_view extra_headers = {}) {
+  return SendParts(
+      "127.0.0.1", port,
+      {"POST /v1/embeddings HTTP/1.1\r\n" + std::string(extra_headers) +
+       "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" +
+       std::string(body)});
+}
+
+void TestEmbeddingService() {
+  const std::string request = R"({"model":"embedding-test","input":"hi"})";
+  {
+    auto service = MakeEmbeddingService(true);
+    assert(service->ready());
+    HttpServer server("127.0.0.1", 0, nullptr, nullptr, nullptr, nullptr,
+                      {.api_key = "test-secret"}, nullptr, service);
+    std::string error;
+    assert(server.start(&error));
+    std::binary_semaphore finished{0};
+    std::jthread worker([&] {
+      server.run(false);
+      finished.release();
+    });
+    const int port = server.port();
+    ExpectStatus(EmbeddingPost(port, request), 401);
+    ExpectStatus(EmbeddingPost(port, request, "Authorization: Bearer nope\r\n"),
+                 401);
+    const auto response =
+        EmbeddingPost(port, request, "Authorization: Bearer test-secret\r\n");
+    ExpectStatus(response, 200);
+    assert(response.find("\"object\":\"list\"") != std::string::npos);
+    assert(response.find("\"embedding\":[1,0]") != std::string::npos);
+    assert(response.find("\"prompt_tokens\":4") != std::string::npos);
+    assert(response.find("\"model\":\"embedding-test\"") != std::string::npos);
+    const auto missing_model =
+        EmbeddingPost(port, R"({"model":"other","input":"hi"})",
+                      "Authorization: Bearer test-secret\r\n");
+    ExpectStatus(missing_model, 404);
+    assert(missing_model.find("\"code\":\"model_not_found\"") !=
+           std::string::npos);
+    const auto models = SendParts("127.0.0.1", port,
+                                  {"GET /v1/models HTTP/1.1\r\nAuthorization: "
+                                   "Bearer test-secret\r\n\r\n"});
+    ExpectStatus(models, 200);
+    assert(models.find("\"id\":\"embedding-test\"") != std::string::npos);
+    assert(models.find("\"capability\":\"embedding\"") != std::string::npos);
+    const auto ready = SendParts(
+        "127.0.0.1", port,
+        {"GET /ready HTTP/1.1\r\nAuthorization: Bearer test-secret\r\n\r\n"});
+    ExpectStatus(ready, 200);
+    assert(ready.find("\"model\":\"embedding-test\"") != std::string::npos);
+    // Routes of other modalities stay absent.
+    ExpectStatus(
+        SendParts("127.0.0.1", port,
+                  {"POST /v1/chat/completions HTTP/1.1\r\nAuthorization: "
+                   "Bearer test-secret\r\nContent-Length: 2\r\n\r\n{}"}),
+        404);
+    server.stop();
+    worker.join();
+  }
+  {
+    // A service that failed to start is not ready and answers 503.
+    auto service = MakeEmbeddingService(false);
+    assert(!service->ready());
+    HttpServer server("127.0.0.1", 0, nullptr, nullptr, nullptr, nullptr, {},
+                      nullptr, service);
+    std::string error;
+    assert(server.start(&error));
+    std::jthread worker([&] { server.run(false); });
+    const int port = server.port();
+    const auto response = EmbeddingPost(port, request);
+    ExpectStatus(response, 503);
+    assert(response.find("\"code\":\"embedding_service_unavailable\"") !=
+           std::string::npos);
+    ExpectStatus(SendParts("127.0.0.1", port, {"GET /ready HTTP/1.1\r\n\r\n"}),
+                 503);
+    const auto models =
+        SendParts("127.0.0.1", port, {"GET /v1/models HTTP/1.1\r\n\r\n"});
+    assert(models.find("embedding-test") == std::string::npos);
+    server.stop();
+    worker.join();
+  }
+  {
+    // Without an embedding service, a server with no text backend does not
+    // serve the route, and one with a backend keeps its stub.
+    HttpServer server("127.0.0.1", 0, nullptr);
+    std::string error;
+    assert(server.start(&error));
+    std::jthread worker([&] { server.run(false); });
+    ExpectStatus(EmbeddingPost(server.port(), request), 404);
+    server.stop();
+    worker.join();
+  }
+  {
+    RunningServer text;
+    const auto response = text.Post("/v1/embeddings", R"({"input":"hi"})");
+    assert(!response.starts_with("HTTP/1.1 200 "));
+    assert(response.find("embedding_service_unavailable") == std::string::npos);
+  }
+  {
+    // A lost device answers 503, runs the shutdown hook once, and fails the
+    // health probe from then on.
+    auto service = std::make_shared<gufo::server::EmbeddingService>(
+        gufo::server::EmbeddingServiceOptions{
+            .model_root = "/nonexistent/embeddinggemma",
+            .validate_model = false,
+            .model_id = "embedding-test",
+            .runner =
+                [](const std::vector<gufo::server::EmbeddingInput>&,
+                   gufo::server::EmbeddingBatch*, std::string*) {
+                  return gufo::server::EmbeddingStatus::kDeviceLost;
+                },
+        });
+    std::atomic<int> hook_calls{0};
+    HttpServer server("127.0.0.1", 0, nullptr, nullptr, nullptr, nullptr,
+                      {.on_device_lost = [&] { ++hook_calls; }}, nullptr,
+                      service);
+    std::string error;
+    assert(server.start(&error));
+    std::jthread worker([&] { server.run(false); });
+    const int port = server.port();
+    ExpectStatus(SendParts("127.0.0.1", port, {"GET /health HTTP/1.1\r\n\r\n"}),
+                 200);
+    const auto lost = EmbeddingPost(port, request);
+    ExpectStatus(lost, 503);
+    assert(lost.find("\"code\":\"device_lost\"") != std::string::npos);
+    assert(hook_calls.load() == 1);
+    ExpectStatus(SendParts("127.0.0.1", port, {"GET /health HTTP/1.1\r\n\r\n"}),
+                 503);
+    ExpectStatus(EmbeddingPost(port, request), 503);
+    assert(hook_calls.load() == 1);
+    server.stop();
+    worker.join();
+  }
+  {
+    // With both configured, the service answers instead of the text stub.
+    auto service = MakeEmbeddingService(true);
+    auto backend = std::make_shared<FakeBackend>();
+    HttpServer server("127.0.0.1", 0, backend, nullptr, nullptr, nullptr, {},
+                      nullptr, service);
+    std::string error;
+    assert(server.start(&error));
+    std::jthread worker([&] { server.run(false); });
+    ExpectStatus(EmbeddingPost(server.port(), request), 200);
+    server.stop();
+    worker.join();
+  }
+}
+
 int main() {
   // The log assertions below match "[LEVEL] [component]" text written to a
   // redirected stderr sink, so the real stderr's TTY state must not add ANSI
@@ -3003,12 +3354,15 @@ int main() {
   TestQueryParameters();
   TestAuthorization();
   TestFramingAndMetrics();
+  TestExpectContinue();
   TestFallbackBackendMetrics();
+  TestLlamaProps();
   TestLlamaSlotsAndMetrics();
   TestCompatibilityRequests();
   TestTextOnlyBackendRefusesImagesBeforeReading();
   TestResponsesToolImages();
   TestModelInputModalities();
+  TestServedModelNames();
   TestRawCompletionStreaming();
   TestGenerationFailureLogsCause();
   TestDeviceLoss();
@@ -3026,5 +3380,6 @@ int main() {
   TestDeferredStreamHeaders();
   TestAdmittedStreamHeaders();
   TestSignalShutdown();
+  TestEmbeddingService();
   std::cout << "HTTP transport checks passed.\n";
 }
